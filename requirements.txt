@@ -62,8 +62,6 @@ platformdirs==4.9.2
 probe==0.0.2
 prompt_toolkit==3.0.52
 psycopg==3.2.3
-psycopg-binary==3.2.13
-psycopg2-binary==2.9.11
 ptyprocess==0.7.0
 pure_eval==0.2.3
 pyasn1==0.6.2
