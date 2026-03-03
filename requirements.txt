@@ -59,7 +59,6 @@ pexpect==4.9.0
 pickleshare==0.7.5
 pillow==12.1.0
 platformdirs==4.9.2
-probe==0.0.2
 prompt_toolkit==3.0.52
 psycopg==3.2.3
 ptyprocess==0.7.0
