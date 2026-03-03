@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <link rel="shortcut icon" type="image/ico" href="data:image/x-icon;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAAjJJREFUeNpi/P//P8NAAiaGAQajDhhwB7Cw+C86MKAOAGL7IRsF+vKPGOw1b9DXAfkeO+GWz0+bzTAPiP2Nz6LI0cwBfTFLGXqjl4Hpiw/lGD584wKLbzxrzFAXtJ6hLnA92EECXN9ISgMEAchAkGUgSy89kgPTIJA0MxXFEQ7A6ADxQVhB5A3DgzciBM1mZPZb+J9QPMfbHmZ4CDRs/1UthkuPZeEOwuZIPdnHDIpirxji7Y4wNK4LhDuWoijwNz7HkOe+i+HTd04wH91yZLFHb4XBlvsZnQOGwmvKowDkg41njcAWEBOkIHUHr2uA8YM3otSJAphDSAWgqFt42BavGmYm9cAG3EF/Fpiq5zB46F1mePGRn+HmcymiLAYlwH3V7QzhFicYONh+A0NDk7w0AErZH6GpGsQmFoCi6gI4m3IzLDpkS1kUgHwDM5QUANIHS5jYEi3RuQBksb3mdXhaILbcyAOWirAygaJcAEoHoJIPBJzaqggmRpDloPjXk3sEVksoERJ0ACjuD944As8JoMoHlMVw5RiQmgNAeVAauPBInvJsiAxA5X287RGgr2wYmoClHMi3IAyKJlBFBCqsQHKTdrgTDHqS6gIYePhahEEemLhAOQPk23z3nQwKom8YJu5wY3gAlcNWTFPNAaCSTaWwl0EeaCkoqEGW68s9BOdzkMXGNc0k1YQkRwE6sIfWfqCQIcXXZIcAOsCVGEl1wMGBbBMyjnbNRh0w0A4ACDAADLUDJHo7TiUAAAAASUVORK5CYII=">
+    
+    
+    
+    
+    <title>data.europa.eu</title>
+    <script type="module" crossorigin src="/data/app.ae7d23c1.js"></script>
+    <link rel="stylesheet" href="/data/assets/index-8b972a1b.css">
+  </head>
+  <body>
+    <div id="app">
+      <div class="spinner-container" id="good">
+        <div class="spinner"> </div>
+      </div>
+    </div>
+  </body>
+  
+</html>
