@@ -76,6 +76,7 @@ python-dotenv==1.0.1
 python-jose==3.5.0
 python-multipart==0.0.21
 PyYAML==6.0.2
+
 pyzmq==27.1.0
 recurrent==0.2.4
 referencing==0.37.0
