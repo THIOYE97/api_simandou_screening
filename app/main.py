@@ -30,7 +30,7 @@ app.include_router(auth_invite_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://api-simandou-screening.onrender.com"],
+    allow_origins=["https://simandou-screening-frontend.vercel.app"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
