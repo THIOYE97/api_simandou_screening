@@ -32,7 +32,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://simandou-screening-frontend.vercel.app",
-        "https://back-office-simandou-screening.vercel.app"
+        "https://back-office-simandou-screening.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
