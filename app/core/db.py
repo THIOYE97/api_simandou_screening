@@ -28,10 +28,6 @@ def reset_context(db: Session) -> None:
 
 
 def try_set_role(db: Session, role: str) -> bool:
-    """
-    Tente SET ROLE <role>. Retourne True si ok, False sinon.
-    Ne lève pas d'exception (important en prod).
-    """
     role = (role or "").strip()
     if not role:
         return False
@@ -41,6 +37,21 @@ def try_set_role(db: Session, role: str) -> bool:
     except Exception as e:
         print(f"[DB] SET ROLE {role} failed:", repr(e))
         return False
+
+
+# ✅ RESTORE: utilisés par screening.py / autres routes
+def set_tenant_context(db: Session, tenant_id: str | None) -> None:
+    db.execute(
+        text("SELECT set_config('app.tenant_id', :tid, false)"),
+        {"tid": str(tenant_id or "")},
+    )
+
+
+def set_super_admin_context(db: Session, is_super_admin: bool) -> None:
+    db.execute(
+        text("SELECT set_config('app.is_super_admin', :v, false)"),
+        {"v": "true" if is_super_admin else "false"},
+    )
 
 
 def get_db_session() -> Session:
