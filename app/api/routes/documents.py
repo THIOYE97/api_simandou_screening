@@ -8,7 +8,7 @@ from sqlalchemy import text
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session 
-
+from fastapi import BackgroundTasks 
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db_rls as get_db
 
@@ -172,34 +172,43 @@ def get_case_documents(case_id: UUID, db: Session = Depends(get_db),user=Depends
 @router.post("/{doc_id}/extract")
 def extract_document(
     doc_id: UUID,
+    background_tasks: BackgroundTasks,   # ← ajouter
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
+    # Vérifier que le doc existe avant de répondre
+    from app.services.documents_service import get_document
+    doc = get_document(db, doc_id)  # lève 404 si absent
+
+    # ✅ Répondre IMMÉDIATEMENT, OCR tourne en arrière-plan
+    background_tasks.add_task(_run_ocr_background, doc_id)
+
+    return {
+        "doc_id": str(doc.id),
+        "case_id": str(doc.case_id) if doc.case_id else None,
+        "ocr_status": "PENDING",
+        "message": "OCR en cours, vérifiez le statut dans quelques secondes.",
+        **_build_urls(doc.id),
+    }
+
+
+def _run_ocr_background(doc_id: UUID):
+    """Tourne hors du cycle request/response — pas de timeout Gunicorn."""
+    from app.core.db import SessionLocal
+    db = SessionLocal()
     try:
         doc = extract_document_fields_local(db, doc_id)
-
         prefill = apply_ocr_prefill_to_case(
             db=db,
             case_id=doc.case_id,
             extracted_fields=doc.extracted_fields or {},
             overwrite=False,
         )
-
-        return {
-            "doc_id": str(doc.id),
-            "case_id": str(doc.case_id) if doc.case_id else None,
-            "ocr_status": str(doc.ocr_status),
-            "ocr_confidence": float(doc.ocr_confidence or 0),
-            "extracted_fields": doc.extracted_fields,
-            "prefill": prefill,
-            **_build_urls(doc.id),
-        }
-
+        print(f"[ocr background] ✅ doc={doc_id} confidence={doc.ocr_confidence} prefill={prefill}")
     except Exception as e:
-        # ✅ on LOG absolument tout
-        print("EXTRACT ERROR:", type(e).__name__, str(e))
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
+        print(f"[ocr background] ❌ doc={doc_id} error={e}")
+    finally:
+        db.close()
 # -----------------------------------------------------------------------------
 # Serve file (preview/download)
 # -----------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
 from app.api.routes.screening import router as screening_router
 from app.api.routes.health import router as health_router
@@ -13,6 +14,17 @@ from app.api.routes.analyst import router as analyst_router
 from app.api.routes.admin_tenants import router as admin_tenants_router
 from app.api.routes.auth_invite import router as auth_invite_router
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ✅ Précharge EasyOCR au démarrage du worker, pas au premier appel
+    print("[startup] Préchargement EasyOCR...")
+    try:
+        from app.services.local_ocr_service import _get_reader
+        _get_reader()
+        print("[startup] ✅ EasyOCR prêt")
+    except Exception as e:
+        print(f"[startup] ⚠️ EasyOCR non disponible: {e}")
+    yield
 
 app = FastAPI(title="simandou-screening-api", version="1.0.0")
 
