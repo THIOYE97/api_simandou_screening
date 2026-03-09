@@ -42,9 +42,7 @@ app.include_router(auth_invite_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://simandou-screening-frontend.vercel.app",
-        "https://back-office-simandou-screening.vercel.app",
+    allow_origins=["app.simandou-screening.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
