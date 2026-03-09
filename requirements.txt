@@ -70,13 +70,12 @@ pydantic-settings==2.6.1
 pydantic_core==2.27.1
 Pygments==2.19.2
 PyJWT==2.10.1
-pytesseract==0.3.13
+easyocr>=1.7.0 
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 python-jose==3.5.0
 python-multipart==0.0.21
 PyYAML==6.0.2
-
 pyzmq==27.1.0
 recurrent==0.2.4
 referencing==0.37.0
