@@ -16,6 +16,7 @@ from app.models.document import Document, StorageBackend, OCRStatus
 from app.services.local_ocr_service import run_local_ocr
 from app.models.case import Case
 
+import shutil
 
 # -----------------------------------------------------------------------------
 # Storage path (ABSOLUTE)
@@ -31,6 +32,15 @@ print("[documents_service] UPLOAD_ROOT =", UPLOAD_ROOT, "| cwd =", Path.cwd())
 # -----------------------------------------------------------------------------
 # Tenant helpers (RLS)
 # -----------------------------------------------------------------------------
+
+def extract_document_fields_local(db, doc_id):
+    # ✅ Vérification au démarrage, pas au moment du crash
+    if not shutil.which("tesseract"):
+        raise RuntimeError(
+            "Tesseract OCR n'est pas installé sur ce serveur. "
+            "Ajoutez 'tesseract-ocr' dans le build command Render."
+        )
+    
 def _current_tenant_uuid(db: Session) -> UUID_T | None:
     val = db.execute(
         text("SELECT nullif(current_setting('app.tenant_id', true), '')")

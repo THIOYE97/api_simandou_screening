@@ -207,92 +207,103 @@ def screening_simple(
     user=Depends(get_current_user),
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
 ):
-    _require_tenant_id(user)
-    created_by = _require_user_id(user)
+    import traceback  # ← temporaire debug
 
-    # ✅ tenant context: header prioritaire si SUPER_ADMIN, sinon tenant du JWT
-    tenant_id = None
+    try:
+        _require_tenant_id(user)
+        created_by = _require_user_id(user)
 
-    if x_tenant_id:
-        if not _is_super_admin(user):
-            raise HTTPException(403, "X-Tenant-Id requires SUPER_ADMIN")
-        tenant_id = x_tenant_id
-    else:
-        tenant_id = _tenant_from_user(user)
+        tenant_id = None
+        if x_tenant_id:
+            if not _is_super_admin(user):
+                raise HTTPException(403, "X-Tenant-Id requires SUPER_ADMIN")
+            tenant_id = x_tenant_id
+        else:
+            tenant_id = _tenant_from_user(user)
 
-    if not tenant_id:
-        raise HTTPException(400, "tenant context missing (no X-Tenant-Id and no tenant_id in token)")
+        if not tenant_id:
+            raise HTTPException(400, "tenant context missing")
 
-    set_tenant_context(db, tenant_id)
+        set_tenant_context(db, tenant_id)
 
-    # 1) Build name
-    if payload.entity_type == "COMPANY":
-        name = (payload.company_name or "").strip()
-    else:
-        name = f"{payload.first_name or ''} {payload.last_name or ''}".strip()
+        if payload.entity_type == "COMPANY":
+            name = (payload.company_name or "").strip()
+        else:
+            name = f"{payload.first_name or ''} {payload.last_name or ''}".strip()
 
-    if not name:
-        raise HTTPException(422, "Missing name/company_name")
+        if not name:
+            raise HTTPException(422, "Missing name/company_name")
 
-    # 2) Ensure case_id
-    if payload.case_id and str(payload.case_id).strip():
-        candidate = str(payload.case_id).strip()
-        if not _case_exists(db, candidate):
-            raise HTTPException(status_code=404, detail="case_id not found")
-        case_id = candidate
-    else:
+        if payload.case_id and str(payload.case_id).strip():
+            candidate = str(payload.case_id).strip()
+            if not _case_exists(db, candidate):
+                raise HTTPException(status_code=404, detail="case_id not found")
+            case_id = candidate
+        else:
+            try:
+                case_id = _create_case_minimal(db, created_by)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print("[SCREENING/SIMPLE] _create_case_minimal FAILED:", traceback.format_exc())
+                raise HTTPException(500, f"Failed to create case: {e}")
+
+        meta = {
+            "trigger": "screening.simple",
+            "entity_type": payload.entity_type,
+            "dob": payload.dob,
+            "nationality": payload.nationality,
+            "country": payload.country,
+            "aliases": payload.aliases,
+            "include_aliases": payload.include_aliases,
+            "max_matches": payload.max_matches,
+            "registration_number": payload.registration_number,
+            "incorporation_country": payload.incorporation_country,
+            "case_id": case_id,
+            "created_by": created_by,
+            "client_name": name,
+        }
+
+        # ✅ On isole run_simple_screening pour voir si c'est lui qui crash
         try:
-            case_id = _create_case_minimal(db, created_by)
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            raise HTTPException(500, f"Failed to create case: {e}")
-
-    meta = {
-        "trigger": "screening.simple",
-        "entity_type": payload.entity_type,
-        "dob": payload.dob,
-        "nationality": payload.nationality,
-        "country": payload.country,
-        "aliases": payload.aliases,
-        "include_aliases": payload.include_aliases,
-        "max_matches": payload.max_matches,
-        "registration_number": payload.registration_number,
-        "incorporation_country": payload.incorporation_country,
-        "case_id": case_id,
-        "created_by": created_by,
-        "client_name": name,
-    }
-
-    out = run_simple_screening(
-        db=db,
-        name=name,
-        client_id=payload.client_id,
-        country_focus=payload.country or payload.incorporation_country,
-        meta=meta,
-    )
-
-    request_id = _extract_request_id(out)
-    if request_id:
-        try:
-            db.execute(
-                text(
-                    """
-                    UPDATE screening_requests
-                    SET
-                      case_id = CAST(:case_id AS uuid),
-                      client_id = COALESCE(client_id, :client_id)
-                    WHERE id = CAST(:rid AS uuid)
-                    """
-                ),
-                {"case_id": case_id, "client_id": payload.client_id, "rid": str(request_id)},
+            out = run_simple_screening(
+                db=db,
+                name=name,
+                client_id=payload.client_id,
+                country_focus=payload.country or payload.incorporation_country,
+                meta=meta,
             )
-            db.commit()
-        except Exception:
-            db.rollback()
-            pass
+        except Exception as e:
+            print("[SCREENING/SIMPLE] run_simple_screening FAILED:", traceback.format_exc())
+            raise HTTPException(500, f"Screening engine error: {e}")
 
-    return ScreeningCheckOut(**out)
+        request_id = _extract_request_id(out)
+        if request_id:
+            try:
+                db.execute(
+                    text("""
+                        UPDATE screening_requests
+                        SET
+                          case_id    = CAST(:case_id AS uuid),
+                          client_id  = COALESCE(client_id, :client_id)
+                        WHERE id = CAST(:rid AS uuid)
+                    """),
+                    {"case_id": case_id, "client_id": payload.client_id, "rid": str(request_id)},
+                )
+                db.commit()
+            except Exception as e:
+                print("[SCREENING/SIMPLE] UPDATE screening_requests FAILED:", traceback.format_exc())
+                db.rollback()
+
+        return ScreeningCheckOut(**out)
+
+    except HTTPException:
+        raise  # ← on laisse passer les HTTPException normales
+    except Exception as e:
+        print("[SCREENING/SIMPLE] UNEXPECTED ERROR:", traceback.format_exc())
+        raise HTTPException(500, f"Unexpected error: {e}")
+    
+    
 @router.post("/check", response_model=ScreeningCheckOut)
 def analyst_check(
     payload: ScreeningCheckIn,
