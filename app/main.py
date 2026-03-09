@@ -42,7 +42,7 @@ app.include_router(auth_invite_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["app.simandou-screening.com"
+    allow_origins=["app.simandou-screening.com","backoffice.simandou-screening.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
