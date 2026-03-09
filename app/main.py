@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import os
 
 from app.api.routes.screening import router as screening_router
 from app.api.routes.health import router as health_router
@@ -26,7 +27,16 @@ async def lifespan(app: FastAPI):
         print(f"[startup] ⚠️ EasyOCR non disponible: {e}")
     yield
 
-app = FastAPI(title="simandou-screening-api", version="1.0.0")
+
+IS_DEV = os.getenv("ENVIRONMENT", "production") == "development"
+
+app = FastAPI(
+    title="simandou-screening-api",
+    version="1.0.0",
+    docs_url="/docs" if IS_DEV else None,      # ← None = désactivé
+    redoc_url="/redoc" if IS_DEV else None,    # ← None = désactivé
+    openapi_url="/openapi.json" if IS_DEV else None,  # ← cache aussi le schema
+)
 
 app.include_router(health_router)
 app.include_router(screening_router)
