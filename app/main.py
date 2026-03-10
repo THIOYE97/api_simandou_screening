@@ -19,21 +19,17 @@ from app.api.routes.auth_invite import router as auth_invite_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ✅ Précharge EasyOCR au démarrage du worker (évite le cold-start timeout)
-    print("[startup] Préchargement EasyOCR...")
-    try:
-        from app.services.local_ocr_service import _get_reader
-        _get_reader()
-        print("[startup] ✅ EasyOCR prêt")
-    except Exception as e:
-        # Non bloquant : le worker démarre quand même, OCR échouera proprement
-        print(f"[startup] ⚠️ EasyOCR non disponible: {e}")
+    # Claude Vision API — pas de preload RAM nécessaire, juste vérifier la clé
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        print("[startup] ✅ ANTHROPIC_API_KEY présente — Claude Vision OCR prêt")
+    else:
+        print("[startup] ⚠️  ANTHROPIC_API_KEY manquante — OCR échouera")
     yield
 
 
 IS_DEV = os.getenv("ENVIRONMENT", "production") == "development"
 
-# ✅ FIX #1 — lifespan= passé à FastAPI (était absent → preload jamais exécuté)
 app = FastAPI(
     title="simandou-screening-api",
     version="1.0.0",
@@ -43,7 +39,6 @@ app = FastAPI(
     openapi_url="/openapi.json" if IS_DEV else None,
 )
 
-# Middleware en premier (avant les routers)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

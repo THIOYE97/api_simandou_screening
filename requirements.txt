@@ -49,7 +49,6 @@ nbclient==0.10.4
 nbconvert==7.17.0
 nbformat==5.10.4
 numpy==2.4.1
-opencv-python==4.13.0.90
 packaging==26.0
 pandocfilters==1.5.1
 parsedatetime==2.6
@@ -70,7 +69,7 @@ pydantic-settings==2.6.1
 pydantic_core==2.27.1
 Pygments==2.19.2
 PyJWT==2.10.1
-easyocr>=1.7.0 
+anthropic>=0.25.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 python-jose==3.5.0
