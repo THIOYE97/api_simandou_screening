@@ -4,14 +4,14 @@ from __future__ import annotations
 from uuid import UUID
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.deps.auth import get_current_user
-from app.api.deps.db import get_db_rls as get_db
+from app.api.deps.db import get_db_rls as get_db  # get_db = get_db_rls
 
 from app.schemas.screening import ScreeningCheckIn, ScreeningCheckOut
 from app.services.simple_screening_engine import run_simple_screening
@@ -67,14 +67,15 @@ def _extract_request_id(out: Any) -> Optional[str]:
     rid = getattr(out, "request_id", None) or getattr(out, "id", None)
     return str(rid) if rid else None
 
+
 def _is_super_admin(user: dict) -> bool:
-    # adapte si chez toi c'est "is_super_admin" / roles etc.
     return bool(user.get("is_super_admin"))
 
+
 def _tenant_from_user(user: dict) -> str | None:
-    # ton JWT log montre bien tenant_id ici
     tid = user.get("tenant_id")
     return str(tid) if tid else None
+
 
 # -----------------------------------------------------------------------------
 # Helpers: create case minimal (SQL) + pick enum
@@ -207,7 +208,7 @@ def screening_simple(
     user=Depends(get_current_user),
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
 ):
-    import traceback  # ← temporaire debug
+    import traceback
 
     try:
         _require_tenant_id(user)
@@ -264,7 +265,6 @@ def screening_simple(
             "client_name": name,
         }
 
-        # ✅ On isole run_simple_screening pour voir si c'est lui qui crash
         try:
             out = run_simple_screening(
                 db=db,
@@ -298,12 +298,12 @@ def screening_simple(
         return ScreeningCheckOut(**out)
 
     except HTTPException:
-        raise  # ← on laisse passer les HTTPException normales
+        raise
     except Exception as e:
         print("[SCREENING/SIMPLE] UNEXPECTED ERROR:", traceback.format_exc())
         raise HTTPException(500, f"Unexpected error: {e}")
-    
-    
+
+
 @router.post("/check", response_model=ScreeningCheckOut)
 def analyst_check(
     payload: ScreeningCheckIn,
@@ -320,7 +320,7 @@ def analyst_check(
         country_focus=payload.country_focus,
         meta={
             "trigger": "analyst.screenings.check",
-            "created_by": created_by,  # ✅ attribue triggered_by
+            "created_by": created_by,
         },
     )
     return ScreeningCheckOut(**out)
@@ -390,7 +390,7 @@ def screening_from_document(
             "trigger": "screening.from_document",
             "document_id": str(doc.id),
             "case_id": case_id,
-            "created_by": created_by,  # ✅ attribue triggered_by
+            "created_by": created_by,
         },
     )
 
@@ -440,17 +440,32 @@ def export_screening_json(
     )
 
 
+# ✅ FIX: _require_tenant_id ajouté + str(request_id) passé à build_screening_pdf
 @router.get("/{request_id}/export.pdf")
 def export_pdf(
-    request_id: str,
+    request_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
+    # ✅ FIX #1 — vérifie le tenant AVANT d'appeler le service PDF
     _require_tenant_id(user)
 
-    pdf_bytes = build_screening_pdf(db, request_id)
-    return StreamingResponse(
-        iter([pdf_bytes]),
+    try:
+        # ✅ FIX #2 — str(request_id) car build_screening_pdf attend un str
+        pdf_bytes = build_screening_pdf(db, str(request_id))
+    except ValueError as e:
+        # ScreeningRequest not found (RLS ou UUID inexistant)
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback
+        print("[export_pdf] ERROR:", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
+
+    return Response(
+        content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="screening_{request_id}.pdf"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="screening-{request_id}.pdf"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
     )
