@@ -218,6 +218,7 @@ def screening_simple(
             try:
                 case_id = _create_case_minimal(db, created_by)
                 db.commit()
+                set_tenant_context(db, tenant_id)
             except Exception as e:
                 db.rollback()
                 print("[SCREENING/SIMPLE] _create_case_minimal FAILED:", traceback.format_exc())
@@ -297,8 +298,11 @@ def analyst_check(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    _require_tenant_id(user)
+    tenant_id = _require_tenant_id(user)
     created_by = _require_user_id(user)
+
+    # 🔴 IMPORTANT
+    set_tenant_context(db, tenant_id)
 
     out = run_simple_screening(
         db=db,
@@ -310,6 +314,7 @@ def analyst_check(
             "created_by": created_by,
         },
     )
+
     return ScreeningCheckOut(**out)
 
 
@@ -326,8 +331,10 @@ def screening_from_document(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    _require_tenant_id(user)
+    tenant_id = _require_tenant_id(user)
+    set_tenant_context(db, tenant_id)
     created_by = _require_user_id(user)
+    
 
     doc = db.query(Document).filter(Document.id == payload.document_id).one_or_none()
     if not doc:
