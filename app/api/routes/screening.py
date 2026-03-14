@@ -5,13 +5,13 @@ from uuid import UUID
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.deps.auth import get_current_user
-from app.api.deps.db import get_db_rls as get_db  # get_db = get_db_rls
+from app.api.deps.db import get_db_rls as get_db
 
 from app.schemas.screening import ScreeningCheckIn, ScreeningCheckOut
 from app.services.simple_screening_engine import run_simple_screening
@@ -25,9 +25,8 @@ from app.core.db import set_tenant_context
 router = APIRouter(prefix="/screening", tags=["screening"])
 
 
-# -----------------------------------------------------------------------------
-# Helpers: robust user access (dict or ORM)
-# -----------------------------------------------------------------------------
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
 def _user_get(user: Any, key: str, default: str = "") -> str:
     if user is None:
         return default
@@ -77,19 +76,15 @@ def _tenant_from_user(user: dict) -> str | None:
     return str(tid) if tid else None
 
 
-# -----------------------------------------------------------------------------
-# Helpers: create case minimal (SQL) + pick enum
-# -----------------------------------------------------------------------------
+# ─── Case helpers ──────────────────────────────────────────────────────────────
+
 def _pick_case_type(db: Session) -> str:
     rows = db.execute(
-        text(
-            """
-            SELECT enumlabel
-            FROM pg_enum
+        text("""
+            SELECT enumlabel FROM pg_enum
             WHERE enumtypid = 'case_type'::regtype
             ORDER BY enumsortorder ASC
-            """
-        )
+        """)
     ).fetchall()
     labels = [r[0] for r in rows if r and r[0]]
     if not labels:
@@ -103,14 +98,11 @@ def _pick_case_type(db: Session) -> str:
 def _pick_case_status(db: Session) -> str:
     try:
         rows = db.execute(
-            text(
-                """
-                SELECT enumlabel
-                FROM pg_enum
+            text("""
+                SELECT enumlabel FROM pg_enum
                 WHERE enumtypid = 'case_status'::regtype
                 ORDER BY enumsortorder ASC
-                """
-            )
+            """)
         ).fetchall()
         labels = [r[0] for r in rows if r and r[0]]
         for preferred in ("DRAFT", "OPEN", "PENDING", "NEW"):
@@ -124,33 +116,21 @@ def _pick_case_status(db: Session) -> str:
 def _create_case_minimal(db: Session, created_by: str) -> str:
     case_type = _pick_case_type(db)
     status = _pick_case_status(db)
-
     row = db.execute(
-        text(
-            """
-            INSERT INTO cases (
-                case_type,
-                created_by,
-                status,
-                created_at,
-                updated_at
-            )
+        text("""
+            INSERT INTO cases (case_type, created_by, status, created_at, updated_at)
             VALUES (
                 CAST(:case_type AS case_type),
                 CAST(:created_by AS uuid),
                 CAST(:status AS case_status),
-                NOW(),
-                NOW()
+                NOW(), NOW()
             )
             RETURNING id::text
-            """
-        ),
+        """),
         {"case_type": case_type, "created_by": created_by, "status": status},
     ).fetchone()
-
     if not row:
         raise HTTPException(500, "Failed to create case")
-
     return str(row[0])
 
 
@@ -161,30 +141,6 @@ def _build_name(extracted: dict) -> str:
     first = (extracted.get("first_name") or "").strip()
     last = (extracted.get("last_name") or "").strip()
     return " ".join([first, last]).strip()
-
-
-# -----------------------------------------------------------------------------
-# Payloads
-# -----------------------------------------------------------------------------
-class SimpleScreeningIn(BaseModel):
-    entity_type: str  # "INDIVIDUAL" | "COMPANY"
-
-    case_id: Optional[str] = None
-    client_id: Optional[str] = None
-
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    dob: Optional[str] = None
-    nationality: Optional[str] = None
-    country: Optional[str] = None
-
-    company_name: Optional[str] = None
-    registration_number: Optional[str] = None
-    incorporation_country: Optional[str] = None
-
-    aliases: list[str] = Field(default_factory=list)
-    include_aliases: bool = True
-    max_matches: int = 20
 
 
 def _case_exists(db: Session, case_id: str) -> bool:
@@ -198,9 +154,27 @@ def _case_exists(db: Session, case_id: str) -> bool:
         return False
 
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
+# ─── Schemas ──────────────────────────────────────────────────────────────────
+
+class SimpleScreeningIn(BaseModel):
+    entity_type: str  # "INDIVIDUAL" | "COMPANY"
+    case_id: Optional[str] = None
+    client_id: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    dob: Optional[str] = None
+    nationality: Optional[str] = None
+    country: Optional[str] = None
+    company_name: Optional[str] = None
+    registration_number: Optional[str] = None
+    incorporation_country: Optional[str] = None
+    aliases: list[str] = Field(default_factory=list)
+    include_aliases: bool = True
+    max_matches: int = 20
+
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
 @router.post("/simple", response_model=ScreeningCheckOut)
 def screening_simple(
     payload: SimpleScreeningIn,
@@ -214,7 +188,6 @@ def screening_simple(
         _require_tenant_id(user)
         created_by = _require_user_id(user)
 
-        tenant_id = None
         if x_tenant_id:
             if not _is_super_admin(user):
                 raise HTTPException(403, "X-Tenant-Id requires SUPER_ADMIN")
@@ -235,6 +208,7 @@ def screening_simple(
         if not name:
             raise HTTPException(422, "Missing name/company_name")
 
+        # Resolve case_id
         if payload.case_id and str(payload.case_id).strip():
             candidate = str(payload.case_id).strip()
             if not _case_exists(db, candidate):
@@ -277,22 +251,35 @@ def screening_simple(
             print("[SCREENING/SIMPLE] run_simple_screening FAILED:", traceback.format_exc())
             raise HTTPException(500, f"Screening engine error: {e}")
 
+        # ✅ FIX: UPDATE screening_requests avec rollback safe
+        # run_simple_screening peut laisser la session en état "aborted"
+        # sur les HIGH RISK screenings → rollback + re-poser tenant context
         request_id = _extract_request_id(out)
         if request_id:
             try:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                set_tenant_context(db, tenant_id)
+
                 db.execute(
                     text("""
                         UPDATE screening_requests
                         SET
-                          case_id    = CAST(:case_id AS uuid),
-                          client_id  = COALESCE(client_id, :client_id)
+                            case_id   = CAST(:case_id AS uuid),
+                            client_id = COALESCE(client_id, :client_id)
                         WHERE id = CAST(:rid AS uuid)
                     """),
-                    {"case_id": case_id, "client_id": payload.client_id, "rid": str(request_id)},
+                    {
+                        "case_id":   case_id,
+                        "client_id": payload.client_id,
+                        "rid":       str(request_id),
+                    },
                 )
                 db.commit()
             except Exception as e:
-                print("[SCREENING/SIMPLE] UPDATE screening_requests FAILED:", traceback.format_exc())
+                print("[SCREENING/SIMPLE] UPDATE screening_requests FAILED (non-bloquant):", e)
                 db.rollback()
 
         return ScreeningCheckOut(**out)
@@ -393,7 +380,6 @@ def screening_from_document(
             "created_by": created_by,
         },
     )
-
     return ScreeningCheckOut(**out)
 
 
@@ -409,26 +395,28 @@ def export_screening_json(
     if not req:
         raise HTTPException(status_code=404, detail="Screening request not found")
 
-    res = db.query(ScreeningResult).filter(ScreeningResult.request_id == req.id).one_or_none()
+    res     = db.query(ScreeningResult).filter(ScreeningResult.request_id == req.id).one_or_none()
     matches = db.query(ScreeningMatch).filter(ScreeningMatch.request_id == req.id).all()
 
     payload = {
-        "request": {"id": str(req.id), "client_id": req.client_id, "request_payload": req.request_payload},
-        "result": None
-        if not res
-        else {
-            "risk_level": res.risk_level,
-            "confidence": res.confidence,
-            "recommended_action": res.recommended_action,
-            "decided_by": res.decided_by,
-            "notes": res.notes,
+        "request": {
+            "id":              str(req.id),
+            "client_id":       req.client_id,
+            "request_payload": req.request_payload,
+        },
+        "result": None if not res else {
+            "risk_level":          res.risk_level,
+            "confidence":          res.confidence,
+            "recommended_action":  res.recommended_action,
+            "decided_by":          res.decided_by,
+            "notes":               res.notes,
         },
         "matches": [
             {
-                "entity_id": str(m.entity_id),
+                "entity_id":   str(m.entity_id),
                 "match_score": m.match_score,
-                "match_band": m.match_band,
-                "reasons": m.reasons,
+                "match_band":  m.match_band,
+                "reasons":     m.reasons,
             }
             for m in matches
         ],
@@ -440,22 +428,34 @@ def export_screening_json(
     )
 
 
-# ✅ FIX: _require_tenant_id ajouté + str(request_id) passé à build_screening_pdf
 @router.get("/{request_id}/export.pdf")
 def export_pdf(
     request_id: UUID,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    # ✅ FIX #1 — vérifie le tenant AVANT d'appeler le service PDF
-    _require_tenant_id(user)
+    tenant_id = _tenant_id(user)
 
     try:
-        # ✅ FIX #2 — str(request_id) car build_screening_pdf attend un str
-        pdf_bytes = build_screening_pdf(db, str(request_id))
+        if db.in_transaction():
+            db.rollback()
+    except Exception:
+        pass
+
+    if tenant_id:
+        set_tenant_context(db, tenant_id)
+
+    try:
+        pdf_bytes = build_screening_pdf(
+            db,
+            str(request_id),
+            tenant_id=tenant_id,   # ⭐ IMPORTANT
+        )
+
     except ValueError as e:
-        # ScreeningRequest not found (RLS ou UUID inexistant)
-        raise HTTPException(status_code=404, detail=str(e))
+        print("[PDF VALUE ERROR]", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
     except Exception as e:
         import traceback
         print("[export_pdf] ERROR:", traceback.format_exc())

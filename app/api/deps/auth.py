@@ -50,15 +50,33 @@ def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload (sub missing)")
 
-    # 2) lecture user via db_public (pas de tenant ctx ici)
+    # 2) ✅ FIX: bypass RLS pour lire public.users (identique au login)
+    try:
+        db_public.execute(text("SET ROLE auth_bypass_rls"))
+    except Exception as e:
+        print("[AUTH] SET ROLE auth_bypass_rls failed:", repr(e))
+        raise HTTPException(status_code=500, detail="Auth DB role misconfigured")
+
     user = db_public.execute(
         text("""
-            SELECT id, email, full_name, tenant_id, is_active, status
+            SELECT
+              id::text AS id,
+              email,
+              full_name,
+              tenant_id::text AS tenant_id,
+              is_active,
+              status
             FROM public.users
-            WHERE id = :id
+            WHERE id = CAST(:id AS uuid)
         """),
         {"id": user_id},
     ).mappings().first()
+
+    # ✅ Toujours reset le rôle après lecture
+    try:
+        db_public.execute(text("RESET ROLE"))
+    except Exception:
+        pass
 
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -75,7 +93,7 @@ def get_current_user(
     if not effective_tenant_id:
         raise HTTPException(status_code=401, detail="Invalid token payload (tenant_id missing)")
 
-    # 4) appliquer contexte RLS SUR db (la session “RLS”)
+    # 4) appliquer contexte RLS SUR db (la session "RLS")
     set_super_admin_context(db, is_super_admin)
     set_tenant_context(db, effective_tenant_id)
 

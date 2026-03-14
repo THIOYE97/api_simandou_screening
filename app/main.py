@@ -10,11 +10,9 @@ from app.api.routes import admin
 from app.api.routes.cases import router as cases_router
 from app.api.routes.documents import router as documents_router
 from app.api.routes.auth import router as auth_router
-from app.api.routes.sumsub import router as sumsub_router
 from app.api.routes.cascade import router as cascade_router
 from app.api.routes.analyst import router as analyst_router
 from app.api.routes.admin_tenants import router as admin_tenants_router
-from app.api.routes.auth_invite import router as auth_invite_router
 
 
 @asynccontextmanager
@@ -43,7 +41,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://app.simandou-screening.com",
-        "https://backoffice.simandou-screening.com",
+        "https://backoffice.simandou-screening.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -56,8 +54,6 @@ app.include_router(admin.router)
 app.include_router(auth_router)
 app.include_router(cases_router)
 app.include_router(documents_router)
-app.include_router(sumsub_router)
 app.include_router(cascade_router)
 app.include_router(analyst_router)
 app.include_router(admin_tenants_router)
-app.include_router(auth_invite_router)

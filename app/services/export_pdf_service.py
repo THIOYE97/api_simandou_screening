@@ -1,4 +1,8 @@
 # app/services/export_pdf_service.py
+# ─────────────────────────────────────────────────────────────
+# PROFESSIONAL PDF EXPORT — Simandou Screening
+# ✅ FIX: SQL raw au lieu d'ORM pour éviter les 404 sur HIGH RISK
+# ─────────────────────────────────────────────────────────────
 from __future__ import annotations
 
 from io import BytesIO
@@ -10,54 +14,60 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    Table,
-    TableStyle,
-    Image,
-    PageBreak,
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    Image, PageBreak, HRFlowable, KeepTogether,
 )
 from reportlab.pdfgen.canvas import Canvas
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
+from app.core.db import set_tenant_context
 
 from app.models.screening_db import (
-    ScreeningRequest,
-    ScreeningResult,
-    ScreeningMatch,
-    SourceRecord,
-    Entity,
+    ScreeningMatch, SourceRecord, Entity,
 )
 
-# -----------------------------------------------------------------------------
-# Assets
-# -----------------------------------------------------------------------------
-ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+# ─── Constants ────────────────────────────────────────────────
+ASSETS_DIR        = Path(__file__).resolve().parents[1] / "assets"
 DEFAULT_LOGO_PATH = ASSETS_DIR / "simandou_screening_logo1.png"
+SOURCE_FALLBACK   = {1: "UN", 2: "OFAC", 3: "EU"}
+PAGE_W, PAGE_H    = A4
+MARGIN            = 18 * mm
+CONTENT_W         = PAGE_W - MARGIN * 2
 
-# -----------------------------------------------------------------------------
-# Small helpers
-# -----------------------------------------------------------------------------
-SOURCE_FALLBACK = {1: "UN", 2: "OFAC", 3: "EU"}
+# ─── Brand colors ─────────────────────────────────────────────
+C_DARK    = colors.HexColor("#0A1628")
+C_NAVY    = colors.HexColor("#0D1E35")
+C_BLUE    = colors.HexColor("#2D7FD6")
+C_BLUE_LT = colors.HexColor("#EBF4FD")
+C_WHITE   = colors.white
+C_GRAY_DK = colors.HexColor("#1E293B")
+C_GRAY_MD = colors.HexColor("#475569")
+C_GRAY_LT = colors.HexColor("#E2E8F0")
+C_GRAY_XL = colors.HexColor("#F8FAFC")
+C_RED     = colors.HexColor("#DC2626")
+C_ORANGE  = colors.HexColor("#D97706")
+C_GREEN   = colors.HexColor("#059669")
+C_RED_BG  = colors.HexColor("#FEF2F2")
+C_ORG_BG  = colors.HexColor("#FFFBEB")
+C_GRN_BG  = colors.HexColor("#F0FDF4")
+C_BORDER  = colors.HexColor("#CBD5E1")
 
 
+# ─── Helpers ──────────────────────────────────────────────────
 def _safe_uuid(v: Union[str, UUID]) -> UUID:
-    """Accepte str ou UUID, retourne toujours UUID."""
     if isinstance(v, UUID):
         return v
     try:
         return UUID(str(v))
-    except Exception as exc:
-        raise ValueError(f"Invalid UUID: {v!r}") from exc
+    except Exception as e:
+        raise ValueError(f"Invalid UUID: {v!r}") from e
 
 
 def _as_text(v: Any) -> str:
-    if v is None:
-        return ""
-    return str(v)
+    return "" if v is None else str(v)
 
 
 def _coalesce(*vals: Any, default: str = "-") -> str:
@@ -71,9 +81,7 @@ def _coalesce(*vals: Any, default: str = "-") -> str:
 
 
 def _normalize_band(band: Any) -> str:
-    if band is None:
-        return "-"
-    v = str(band).upper().strip()
+    v = str(band or "").upper().strip()
     if v in ("STRONG", "HIGH"):
         return "Forte"
     if v in ("MEDIUM", "MID"):
@@ -83,180 +91,96 @@ def _normalize_band(band: Any) -> str:
     return v or "-"
 
 
-def _risk_badge(risk: str) -> tuple[str, colors.Color]:
-    rr = (risk or "").upper().strip()
-    if rr in ("HIGH", "H"):
-        return "HIGH", colors.HexColor("#B91C1C")
-    if rr in ("MEDIUM", "MID", "M"):
-        return "MEDIUM", colors.HexColor("#B45309")
-    if rr in ("LOW", "L"):
-        return "LOW", colors.HexColor("#065F46")
-    return (rr or "-"), colors.HexColor("#334155")
+def _risk_style(risk: str) -> tuple:
+    r = str(risk or "").upper()
+    if r == "HIGH":
+        return C_RED, C_RED_BG, "⚠ ÉLEVÉ"
+    if r == "MEDIUM":
+        return C_ORANGE, C_ORG_BG, "◆ MOYEN"
+    if r == "LOW":
+        return C_GREEN, C_GRN_BG, "✓ FAIBLE"
+    return C_GRAY_MD, C_GRAY_XL, str(risk or "—")
 
 
-def _humanize_match_reasons(reasons: Any) -> list[str]:
+def _action_style(action: str) -> tuple:
+    v = str(action or "").upper()
+    if v == "PASS":
+        return C_GREEN, "✓ APPROUVER"
+    if v == "MANUAL_REVIEW":
+        return C_ORANGE, "◆ REVUE MANUELLE"
+    if v == "BLOCK":
+        return C_RED, "✗ BLOQUER"
+    return C_GRAY_MD, str(action or "—")
+
+
+def _humanize_reasons(reasons: Any) -> list[str]:
     if reasons is None:
         return ["Correspondance détectée par le moteur."]
     if isinstance(reasons, str):
-        s = reasons.strip()
-        return [s] if s else ["Correspondance détectée par le moteur."]
+        return [reasons.strip()] if reasons.strip() else ["Correspondance détectée par le moteur."]
     if isinstance(reasons, list):
-        out = []
-        for it in reasons[:30]:
-            if it is None:
-                continue
-            s = str(it).strip()
-            if s:
-                out.append(s)
-        return out[:12] or ["Correspondance détectée par le moteur."]
+        out = [str(it).strip() for it in reasons[:20] if it and str(it).strip()]
+        return out[:10] or ["Correspondance détectée par le moteur."]
     if isinstance(reasons, dict):
         bullets: list[str] = []
-
         sim = reasons.get("trigram_similarity") or reasons.get("similarity")
         try:
             v = float(sim)
-            pct = int(round((v * 100) if v <= 1 else v))
-            bullets.append(f"Similarité nom (après normalisation) : {pct}%.")
+            pct = int(round(v * 100 if v <= 1 else v))
+            bullets.append(f"Similarité nom : {pct}%")
         except Exception:
             pass
-
-        tok = reasons.get("token_overlap")
-        try:
-            if tok is not None:
-                bullets.append(f"Mots en commun (token overlap) : {int(tok)}.")
-        except Exception:
-            pass
-
         inp = reasons.get("input_normalized") or reasons.get("input")
-        mat = reasons.get("matched_normalized") or reasons.get("matched") or reasons.get("primary_name")
+        mat = reasons.get("matched_normalized") or reasons.get("primary_name")
         if inp and mat:
-            bullets.append(f"Nom analysé : « {inp} » → trouvé : « {mat} ».")
-
+            bullets.append(f"Nom analysé : «{inp}» → trouvé : «{mat}»")
         for k, label in [
-            ("dob_match", "Date de naissance correspondante."),
-            ("doc_match", "Numéro de document correspondant."),
-            ("country_match", "Pays / nationalité correspondante."),
+            ("dob_match",     "Date de naissance ✓"),
+            ("doc_match",     "N° document ✓"),
+            ("country_match", "Pays ✓"),
         ]:
-            if reasons.get(k) is True:
+            if reasons.get(k):
                 bullets.append(label)
-
-        return bullets[:12] or ["Correspondance détectée par le moteur (détails disponibles)."]
-
-    return ["Correspondance détectée par le moteur (détails disponibles)."]
+        return bullets[:8] or ["Correspondance détectée par le moteur."]
+    return ["Correspondance détectée par le moteur."]
 
 
-def _wrapable(s: str, every: int = 48) -> str:
-    if not s:
-        return s
-    out = []
-    for tok in s.split(" "):
-        if len(tok) <= every:
-            out.append(tok)
-            continue
-        chunks = [tok[i: i + every] for i in range(0, len(tok), every)]
-        out.append(" ".join(chunks))
-    return " ".join(out)
-
-
-def _safe_pre(s: str, limit: int = 1800) -> str:
-    s = s or ""
-    s = s.replace("\r", "")
-    if len(s) > limit:
-        s = s[:limit] + " …"
-    return _wrapable(s)
-
-
-def _extract_sanction_bullets(sr: SourceRecord | None) -> list[str]:
+def _sanction_bullets(sr: SourceRecord | None) -> list[str]:
     if not sr:
         return []
-
     bullets: list[str] = []
-
-    summary = getattr(sr, "summary", None)
-    if isinstance(summary, str) and summary.strip():
-        bullets.append(summary.strip())
-
-    program = getattr(sr, "program", None)
-    if program:
-        bullets.append(f"Programme / régime : {program}")
-
-    record_type = getattr(sr, "record_type", None)
-    if record_type:
-        bullets.append(f"Type d'enregistrement : {record_type}")
-
-    listed_on = getattr(sr, "listed_on", None)
-    if listed_on:
-        bullets.append(f"Date d'inscription : {str(listed_on)}")
-
-    unlisted_on = getattr(sr, "unlisted_on", None)
-    if unlisted_on:
-        bullets.append(f"Date de radiation : {str(unlisted_on)}")
-
-    raw_payload = getattr(sr, "raw_payload", None)
-    if isinstance(raw_payload, dict):
-        for k in [
-            "reason", "reasons", "grounds", "narrative", "narrative_summary",
-            "remarks", "designation_reason", "listing_reason", "basis",
-        ]:
-            v = raw_payload.get(k)
+    for attr in ("summary", "program", "record_type"):
+        v = getattr(sr, attr, None)
+        if v:
+            bullets.append(f"{attr.replace('_', ' ').title()} : {v}")
+    lo = getattr(sr, "listed_on", None)
+    if lo:
+        bullets.append(f"Inscrit le : {lo}")
+    ul = getattr(sr, "unlisted_on", None)
+    if ul:
+        bullets.append(f"Retiré le : {ul}")
+    raw = getattr(sr, "raw_payload", None)
+    if isinstance(raw, dict):
+        for k in ("reason", "reasons", "grounds", "narrative_summary", "remarks"):
+            v = raw.get(k)
             if isinstance(v, str) and v.strip():
                 bullets.append(v.strip())
                 break
             if isinstance(v, list) and v:
-                vv = [str(x).strip() for x in v if x is not None and str(x).strip()]
-                if vv:
-                    bullets.append(" / ".join(vv[:3]))
+                s = " / ".join(str(x).strip() for x in v[:3] if x)
+                if s:
+                    bullets.append(s)
                     break
-
-    out = []
-    seen = set()
+    seen: set[str] = set()
+    out: list[str] = []
     for b in bullets:
-        key = b.strip().lower()
-        if key and key not in seen:
-            out.append(b.strip())
-            seen.add(key)
-
-    return out[:12]
+        if b.lower() not in seen:
+            out.append(b)
+            seen.add(b.lower())
+    return out[:8]
 
 
-def _extract_raw_excerpt(sr: SourceRecord | None) -> Any:
-    if not sr:
-        return None
-    raw_payload = getattr(sr, "raw_payload", None)
-    if isinstance(raw_payload, dict):
-        keep_keys = [
-            "source_code", "source_ref", "record_type", "program",
-            "primary_name", "aliases", "nationality", "country",
-            "dob", "birth_place", "identifiers",
-            "reason", "reasons", "narrative_summary", "remarks", "summary",
-        ]
-        excerpt = {k: raw_payload.get(k) for k in keep_keys if k in raw_payload}
-        if excerpt:
-            return excerpt
-        return {k: raw_payload.get(k) for k in list(raw_payload.keys())[:25]}
-    return raw_payload
-
-
-def _case_id_from_request_payload(req_payload: Any) -> str | None:
-    if not isinstance(req_payload, dict):
-        return None
-    meta = req_payload.get("meta") or {}
-    if isinstance(meta, dict):
-        cid = meta.get("case_id")
-        if cid and str(cid).lower() != "none":
-            return str(cid)
-    cid2 = req_payload.get("case_id")
-    if cid2 and str(cid2).lower() != "none":
-        return str(cid2)
-    return None
-
-
-def _best_effort(db: Session, fn: Callable[[], Any], default: Any) -> Any:
-    """
-    Exécute fn() dans un SAVEPOINT.
-    Si ça échoue (RLS, table absente, cast…), rollback le savepoint
-    sans casser la transaction principale.
-    """
+def _best_effort(db: Session, fn: Callable, default: Any) -> Any:
     try:
         with db.begin_nested():
             return fn()
@@ -264,603 +188,695 @@ def _best_effort(db: Session, fn: Callable[[], Any], default: Any) -> Any:
         return default
 
 
-# -----------------------------------------------------------------------------
-# ✅ FIX: _load_analyst_decisions est la source unique de vérité.
-#    L'ancienne version "best_effort" inline dans build_screening_pdf est supprimée.
-# -----------------------------------------------------------------------------
+def _case_id_from_payload(p: Any) -> str | None:
+    if not isinstance(p, dict):
+        return None
+    meta = p.get("meta") or {}
+    if isinstance(meta, dict):
+        c = meta.get("case_id")
+        if c and str(c).lower() != "none":
+            return str(c)
+    c2 = p.get("case_id")
+    if c2 and str(c2).lower() != "none":
+        return str(c2)
+    return None
+
+
 def _load_analyst_decisions(
     db: Session,
     *,
     request_id: str | None = None,
     case_id: str | None = None,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """
-    Retourne (latest, history) depuis case_screening_decisions.
-    - Cherche d'abord par request_id, puis fallback case_id.
-    - Wrappé dans _best_effort pour ne jamais casser la transaction principale.
-    """
+) -> tuple[dict | None, list[dict]]:
     if not request_id and not case_id:
         return None, []
 
-    def _rows_to_latest_history(rows) -> tuple[dict | None, list[dict]]:
-        history = [dict(r) for r in rows]
-        return (history[0] if history else None), history
+    def _rows(rows: Any) -> tuple[dict | None, list[dict]]:
+        h = [dict(r) for r in rows]
+        return (h[0] if h else None), h
 
     def _run() -> tuple[dict | None, list[dict]]:
-        has_tbl = db.execute(
+        has = db.execute(
             text("SELECT to_regclass('public.case_screening_decisions')")
         ).scalar()
-        if not has_tbl:
+        if not has:
             return None, []
 
-        # 1) par request_id
+        Q = """
+            SELECT decision, comment, decided_at, decided_by_email,
+                   decided_by_user_id::text, request_id::text, case_id::text
+            FROM public.case_screening_decisions
+            WHERE {col} = CAST(:{p} AS uuid)
+            ORDER BY decided_at DESC LIMIT 50
+        """
+
         if request_id:
             rows = db.execute(
-                text("""
-                    SELECT
-                      decision, comment, decided_at,
-                      decided_by_email,
-                      decided_by_user_id::text AS decided_by_user_id,
-                      request_id::text AS request_id,
-                      case_id::text AS case_id
-                    FROM public.case_screening_decisions
-                    WHERE request_id = CAST(:rid AS uuid)
-                    ORDER BY decided_at DESC
-                    LIMIT 50
-                """),
-                {"rid": request_id},
+                text(Q.format(col="request_id", p="rid")), {"rid": request_id}
             ).mappings().all()
-            latest, history = _rows_to_latest_history(rows)
-            if latest:
-                return latest, history
+            l, h = _rows(rows)
+            if l:
+                return l, h
 
-        # 2) fallback par case_id
         if case_id:
             rows = db.execute(
-                text("""
-                    SELECT
-                      decision, comment, decided_at,
-                      decided_by_email,
-                      decided_by_user_id::text AS decided_by_user_id,
-                      request_id::text AS request_id,
-                      case_id::text AS case_id
-                    FROM public.case_screening_decisions
-                    WHERE case_id = CAST(:cid AS uuid)
-                    ORDER BY decided_at DESC
-                    LIMIT 50
-                """),
-                {"cid": case_id},
+                text(Q.format(col="case_id", p="cid")), {"cid": case_id}
             ).mappings().all()
-            return _rows_to_latest_history(rows)
+            return _rows(rows)
 
         return None, []
 
     return _best_effort(db, _run, (None, []))
 
 
-# -----------------------------------------------------------------------------
-# Header / Footer
-# -----------------------------------------------------------------------------
-def _header_footer(canvas: Canvas, doc, title: str) -> None:
-    w, h = A4
+# ─── Styles ───────────────────────────────────────────────────
+def _build_styles() -> dict:
+    S = getSampleStyleSheet()
 
-    canvas.setStrokeColor(colors.HexColor("#CBD5E1"))
-    canvas.setLineWidth(0.6)
-    canvas.line(18 * mm, h - 18 * mm, w - 18 * mm, h - 18 * mm)
+    def ps(name: str, **kw: Any) -> ParagraphStyle:
+        return ParagraphStyle(name, parent=S["Normal"], **kw)
 
-    canvas.setFont("Helvetica-Bold", 10)
-    canvas.setFillColor(colors.HexColor("#0F172A"))
-    canvas.drawString(18 * mm, h - 14 * mm, title)
+    return {
+        "title": ps("pdf_title",
+            fontName="Helvetica-Bold", fontSize=20, leading=24,
+            textColor=C_DARK, spaceAfter=4, alignment=TA_LEFT),
+        "section_header": ps("pdf_section_header",
+            fontName="Helvetica-Bold", fontSize=8, leading=10,
+            textColor=C_WHITE, alignment=TA_LEFT),
+        "label": ps("pdf_label",
+            fontName="Helvetica-Bold", fontSize=8, leading=11,
+            textColor=C_GRAY_MD),
+        "value": ps("pdf_value",
+            fontName="Helvetica", fontSize=10, leading=13,
+            textColor=C_DARK),
+        "body": ps("pdf_body",
+            fontName="Helvetica", fontSize=9, leading=13,
+            textColor=C_GRAY_DK),
+        "small": ps("pdf_small",
+            fontName="Helvetica", fontSize=8, leading=11,
+            textColor=C_GRAY_MD),
+        "bullet": ps("pdf_bullet",
+            fontName="Helvetica", fontSize=9, leading=13,
+            textColor=C_GRAY_DK, leftIndent=10),
+    }
 
-    canvas.setStrokeColor(colors.HexColor("#E2E8F0"))
-    canvas.setLineWidth(0.6)
-    canvas.line(18 * mm, 14 * mm, w - 18 * mm, 14 * mm)
 
-    canvas.setFont("Helvetica", 9)
-    canvas.setFillColor(colors.HexColor("#475569"))
-    canvas.drawString(18 * mm, 9 * mm, "Confidentiel – Simandou Screening")
+# ─── Canvas header/footer ─────────────────────────────────────
+def _make_header_footer(title: str, report_id: str, tenant: str = "Simandou Screening"):
+    def draw(canvas: Canvas, doc: Any) -> None:
+        w, h = A4
+        # Header
+        canvas.setFillColor(C_NAVY)
+        canvas.rect(0, h - 12 * mm, w, 12 * mm, fill=1, stroke=0)
+        canvas.setFont("Helvetica-Bold", 9)
+        canvas.setFillColor(C_WHITE)
+        canvas.drawString(MARGIN, h - 7.5 * mm, title)
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#94A3B8"))
+        canvas.drawRightString(w - MARGIN, h - 7.5 * mm, f"Réf: {report_id[:16]}…")
+        # Footer
+        canvas.setFillColor(C_GRAY_XL)
+        canvas.rect(0, 0, w, 10 * mm, fill=1, stroke=0)
+        canvas.setStrokeColor(C_BORDER)
+        canvas.setLineWidth(0.5)
+        canvas.line(MARGIN, 10 * mm, w - MARGIN, 10 * mm)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(C_GRAY_MD)
+        canvas.drawString(MARGIN, 3.5 * mm, f"CONFIDENTIEL — {tenant} — Document généré automatiquement")
+        canvas.setFillColor(C_BLUE)
+        canvas.drawRightString(w - MARGIN, 3.5 * mm, f"Page {canvas.getPageNumber()}")
 
-    page = canvas.getPageNumber()
-    canvas.drawRightString(w - 18 * mm, 9 * mm, f"Page {page}")
+    return draw
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
-def build_screening_pdf(db: Session, request_id: Union[str, UUID]) -> bytes:
-    """
-    Génère le PDF de rapport pour un screening_request.
+# ─── Table builders ───────────────────────────────────────────
+def _section_header_table(title: str, ST: dict) -> Table:
+    t = Table([[Paragraph(title.upper(), ST["section_header"])]], colWidths=[CONTENT_W])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), C_NAVY),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return t
 
-    Args:
-        db:          Session SQLAlchemy avec tenant context posé (RLS actif).
-        request_id:  str ou UUID — ID de screening_requests.id
 
-    Raises:
-        ValueError: si le screening n'existe pas (RLS ou UUID inconnu → 404 côté route).
-    """
-    # ✅ FIX: normalisation robuste str|UUID → UUID
+def _two_col_table(rows: list[tuple[str, str]], ST: dict) -> Table:
+    data = [[Paragraph(k, ST["label"]), Paragraph(v, ST["value"])] for k, v in rows]
+    t = Table(data, colWidths=[42 * mm, CONTENT_W - 42 * mm])
+    t.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LINEBELOW",     (0, 0), (-1, -2), 0.4, C_GRAY_LT),
+    ]))
+    return t
+
+
+def _kpi_row(kpis: list[dict], ST: dict) -> Table:
+    cells = []
+    for kpi in kpis:
+        col = kpi["color"]
+        cells.append([
+            Paragraph(
+                kpi["label"].upper(),
+                ParagraphStyle(f"kl_{kpi['label']}", fontName="Helvetica", fontSize=7,
+                               textColor=col, leading=9),
+            ),
+            Paragraph(
+                kpi["value"],
+                ParagraphStyle(f"kv_{kpi['label']}", fontName="Helvetica-Bold", fontSize=16,
+                               textColor=col, leading=18),
+            ),
+        ])
+    col_w = CONTENT_W / len(kpis)
+    t = Table([cells], colWidths=[col_w] * len(kpis))
+    t.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("BOX",           (0, 0), (-1, -1), 0.5, C_BORDER),
+        ("LINEAFTER",     (0, 0), (-2, -1), 0.5, C_BORDER),
+        ("BACKGROUND",    (0, 0), (-1, -1), C_GRAY_XL),
+    ]))
+    return t
+
+
+# ─── Main ─────────────────────────────────────────────────────
+def build_screening_pdf(db: Session, request_id: Union[str, UUID],tenant_id: str | None = None) -> bytes:
+    if tenant_id:
+        set_tenant_context(db, tenant_id)
+
     req_id = _safe_uuid(request_id)
     req_id_str = str(req_id)
 
-    # ✅ FIX: one_or_none() + ValueError propre → la route attrape et retourne 404
-    req = db.query(ScreeningRequest).filter(ScreeningRequest.id == req_id).one_or_none()
-    if not req:
+    # 🔑 important : reposer le tenant context
+    try:
+        tid = db.execute(text("SELECT current_setting('app.tenant_id', true)")).scalar()
+        if tid:
+            set_tenant_context(db, tid)
+    except Exception:
+        pass
+
+   
+
+    # ✅ FIX: SQL raw — contourne le cache de session ORM dégradé
+    req_row = db.execute(
+    text("""
+        SELECT
+            r.id::text AS id,
+            r.provider,
+            r.status,
+            r.created_at,
+            r.completed_at,
+            r.case_id::text AS case_id,
+            r.client_id,
+            r.request_payload
+        FROM public.screening_requests r
+        WHERE r.id = CAST(:rid AS uuid)
+
+        UNION ALL
+
+        SELECT
+            s.request_id::text AS id,
+            'INTERNAL' AS provider,
+            'DONE' AS status,
+            NULL AS created_at,
+            NULL AS completed_at,
+            NULL AS case_id,
+            NULL AS client_id,
+            '{}'::jsonb AS request_payload
+        FROM screening_results s
+        WHERE s.request_id = CAST(:rid AS uuid)
+
+        LIMIT 1
+    """),
+    {"rid": req_id_str},
+).mappings().first()
+    
+    print(
+    db.execute(
+        text("""
+        SELECT
+            EXISTS(SELECT 1 FROM screening_requests WHERE id=:rid) as req,
+            EXISTS(SELECT 1 FROM screening_results WHERE request_id=:rid) as res
+        """),
+        {"rid": req_id_str}
+    ).fetchone()
+)
+
+    if not req_row:
         raise ValueError(
             f"ScreeningRequest {req_id_str} introuvable "
-            "(vérifiez que le tenant context est posé et que l'UUID est correct)"
+            "(vérifiez tenant context et UUID)"
         )
 
-    res = db.query(ScreeningResult).filter(ScreeningResult.request_id == req_id).one_or_none()
+    req_payload = req_row.get("request_payload") or {}
+    if not isinstance(req_payload, dict):
+        req_payload = {}
 
-    # matches
-    matches = (
-        db.execute(
-            select(
-                ScreeningMatch.id,
-                ScreeningMatch.request_id,
-                ScreeningMatch.entity_id,
-                ScreeningMatch.source_record_id,
-                ScreeningMatch.match_score,
-                ScreeningMatch.match_band,
-                ScreeningMatch.reasons,
-                ScreeningMatch.created_at,
-            )
-            .where(ScreeningMatch.request_id == req_id)
-            .order_by(ScreeningMatch.created_at.desc(), ScreeningMatch.id.asc())
-            .limit(200)
-        )
-        .mappings()
-        .all()
+    # Proxy compatible avec le reste du code
+    class _Req:
+        id              = req_row["id"]
+        provider        = req_row.get("provider")     or "INTERNAL"
+        status          = req_row.get("status")       or "DONE"
+        created_at      = req_row.get("created_at")
+        completed_at    = req_row.get("completed_at")
+        case_id         = req_row.get("case_id")
+        client_id       = req_row.get("client_id")
+        request_payload = req_payload
+
+    req = _Req()
+
+    # ✅ FIX: result via SQL raw aussi
+    res_row = db.execute(
+        text("""
+            SELECT
+                id::text            AS id,
+                request_id::text    AS request_id,
+                risk_level,
+                confidence,
+                recommended_action,
+                decided_by,
+                decided_at,
+                notes
+            FROM public.screening_results
+            WHERE request_id = CAST(:rid AS uuid)
+            LIMIT 1
+        """),
+        {"rid": req_id_str},
+    ).mappings().first()
+
+    class _Res:
+        risk_level         = res_row.get("risk_level")         if res_row else None
+        confidence         = res_row.get("confidence")         if res_row else None
+        recommended_action = res_row.get("recommended_action") if res_row else None
+        decided_by         = res_row.get("decided_by")         if res_row else "SYSTEM"
+        decided_at         = res_row.get("decided_at")         if res_row else None
+        notes              = res_row.get("notes")              if res_row else None
+
+    res = _Res() if res_row else None
+
+    # ✅ FIX: matches via SQL raw
+    match_rows = db.execute(
+        text("""
+            SELECT
+                id,
+                request_id::text        AS request_id,
+                entity_id,
+                source_record_id,
+                match_score,
+                match_band,
+                reasons,
+                created_at
+            FROM public.screening_matches
+            WHERE request_id = CAST(:rid AS uuid)
+            ORDER BY match_score DESC
+            LIMIT 200
+        """),
+        {"rid": req_id_str},
+    ).mappings().all()
+    matches = list(match_rows)
+
+    # Case ID
+    case_id = _coalesce(
+        getattr(req, "case_id", None),
+        _case_id_from_payload(req_payload),
+        default="",
     )
 
-    payload = getattr(req, "request_payload", {}) or {}
-    if not isinstance(payload, dict):
-        payload = {}
-
-    # case_id: req.case_id > payload.case_id > payload.meta.case_id
-    case_id = (
-        _coalesce(
-            getattr(req, "case_id", None),
-            payload.get("case_id"),
-            _case_id_from_request_payload(payload),
-            default="",
-        )
-        or ""
-    )
-
-    # ✅ FIX: documents via _best_effort (SAVEPOINT) → jamais de crash si table absent
+    # Documents
     if case_id:
-        def _load_documents():
+        def _load_docs() -> list[dict]:
             rows = db.execute(
                 text("""
                     SELECT
-                      d.id::text AS id,
-                      d.case_id::text AS case_id,
-                      d.doc_type::text AS doc_type,
-                      d.uploaded_at AS uploaded_at,
-                      d.ocr_status::text AS ocr_status,
-                      d.ocr_confidence AS ocr_confidence,
-                      d.original_filename AS original_filename,
-                      d.object_key AS object_key,
-                      d.mime_type AS mime,
-                      d.extracted_fields AS extracted_fields
+                        d.id::text              AS id,
+                        d.case_id::text         AS case_id,
+                        d.doc_type::text        AS doc_type,
+                        d.uploaded_at,
+                        d.ocr_status::text      AS ocr_status,
+                        d.ocr_confidence,
+                        d.original_filename,
+                        d.extracted_fields
                     FROM documents d
                     WHERE d.case_id = CAST(:cid AS uuid)
-                    ORDER BY d.uploaded_at DESC
-                    LIMIT 50
+                    ORDER BY d.uploaded_at DESC LIMIT 10
                 """),
                 {"cid": case_id},
             ).mappings().all()
             return [dict(r) for r in rows]
 
-        docs = _best_effort(db, _load_documents, [])
+        docs = _best_effort(db, _load_docs, [])
         if docs:
-            payload["documents"] = docs
+            req_payload["documents"] = docs
 
-    # ✅ FIX: utilise _load_analyst_decisions (module-level) — plus de copie inline
-    latest_decision, decision_history = _load_analyst_decisions(
-        db,
-        request_id=req_id_str,
-        case_id=case_id or None,
+    # Decisions
+    latest_dec, dec_history = _load_analyst_decisions(
+        db, request_id=req_id_str, case_id=case_id or None
     )
 
-    # bulk enrich (entities + source records)
-    entity_ids = list({r["entity_id"] for r in matches if r.get("entity_id")})
-    sr_ids = list({r["source_record_id"] for r in matches if r.get("source_record_id")})
+    # Enrich matches with ORM (entities + source records)
+    entity_ids = []
+    for r in matches:
+        eid = r.get("entity_id")
+        if not eid:
+            pass  # skip if eid is None
+        else:
+            try:
+                entity_ids.append(UUID(str(eid)))
+            except Exception:
+                pass
+    sr_ids = []
+    for r in matches:
+        sid = r.get("source_record_id")
+        if sid:
+            sr_ids.append(str(sid))
 
-    entities_by_id: dict[str, Entity] = {}
+    entities: dict[str, Entity] = {}
     if entity_ids:
-        ents = db.execute(select(Entity).where(Entity.id.in_(entity_ids))).scalars().all()
-        entities_by_id = {str(e.id): e for e in ents}
+        ents = db.execute(
+            select(Entity).where(Entity.id.in_(entity_ids))
+        ).scalars().all()
+        entities = {str(e.id): e for e in ents}
 
-    source_records_by_id: dict[str, SourceRecord] = {}
+    src_recs: dict[str, SourceRecord] = {}
     if sr_ids:
-        srs = db.execute(select(SourceRecord).where(SourceRecord.id.in_(sr_ids))).scalars().all()
-        source_records_by_id = {str(s.id): s for s in srs}
+        srs = db.execute(
+            select(SourceRecord).where(SourceRecord.id.in_(sr_ids))
+        ).scalars().all()
+        src_recs = {str(s.id): s for s in srs}
 
-    # ✅ FIX: sources map via _best_effort — jamais de crash si table absente
-    def _load_sources_map() -> dict[int, dict[str, str | None]]:
-        has_sources = db.execute(text("SELECT to_regclass('public.sources')")).scalar()
-        if not has_sources:
+    def _load_srcs() -> dict[int, dict]:
+        has = db.execute(text("SELECT to_regclass('public.sources')")).scalar()
+        if not has:
             return {}
         rows = db.execute(
-            text("""
-                SELECT id::int AS id,
-                       COALESCE(code::text, '') AS code,
-                       COALESCE(name::text, '') AS name
-                FROM sources
-            """)
+            text("SELECT id::int, COALESCE(code::text,'') AS code, COALESCE(name::text,'') AS name FROM sources")
         ).mappings().all()
-        out: dict[int, dict[str, str | None]] = {}
+        out: dict[int, dict] = {}
         for r in rows:
-            sid = int(r["id"])
-            code = (r.get("code") or "").strip() or SOURCE_FALLBACK.get(sid, f"SOURCE_{sid}")
+            sid  = int(r["id"])
+            code = (r.get("code") or "").strip() or SOURCE_FALLBACK.get(sid, f"SRC{sid}")
             name = (r.get("name") or "").strip() or None
             out[sid] = {"code": code, "name": name}
         return out
 
-    sources_map: dict[int, dict[str, str | None]] = _best_effort(db, _load_sources_map, {})
+    srcs_map = _best_effort(db, _load_srcs, {})
 
-    # identity
-    full_name = _coalesce(
-        payload.get("override_name"),
-        payload.get("name"),
-        payload.get("full_name"),
-        payload.get("company_name"),
-        default="-",
-    )
-    entity_type = _coalesce(payload.get("entity_type"), payload.get("kind"), default="-")
-    client_id = _coalesce(getattr(req, "client_id", None), payload.get("client_id"), default="-")
+    # Identity
+    full_name    = _coalesce(req_payload.get("override_name"), req_payload.get("name"), req_payload.get("company_name"), default="-")
+    entity_type  = _coalesce(req_payload.get("entity_type"), req_payload.get("kind"), default="-")
+    client_id_v  = _coalesce(getattr(req, "client_id", None), req_payload.get("client_id"), default="-")
+    provider     = _coalesce(getattr(req, "provider", None), default="INTERNAL")
+    status_v     = _coalesce(getattr(req, "status", None), default="-")
+    created_at   = _as_text(getattr(req, "created_at", None))
+    completed_at = _as_text(getattr(req, "completed_at", None))
 
-    # décision moteur
-    risk_level = getattr(res, "risk_level", None) if res else None
-    confidence = getattr(res, "confidence", None) if res else None
-    action = getattr(res, "recommended_action", None) if res else None
-    decided_by = getattr(res, "decided_by", None) if res else None
-    notes = getattr(res, "notes", None) if res else None
-    risk_txt, risk_color = _risk_badge(_as_text(risk_level))
+    risk_level   = _as_text(getattr(res, "risk_level", None) if res else None)
+    confidence   = getattr(res, "confidence", None) if res else None
+    action       = _as_text(getattr(res, "recommended_action", None) if res else None)
+    notes        = _as_text(getattr(res, "notes", None) if res else None)
 
-    # --------------------------------------------------------------------------
-    # Styles
-    # --------------------------------------------------------------------------
-    styles = getSampleStyleSheet()
-    H1 = ParagraphStyle(
-        "H1", parent=styles["Heading1"],
-        fontName="Helvetica-Bold", fontSize=16, leading=20,
-        textColor=colors.HexColor("#0F172A"), spaceAfter=8,
-    )
-    H2 = ParagraphStyle(
-        "H2", parent=styles["Heading2"],
-        fontName="Helvetica-Bold", fontSize=12, leading=14,
-        textColor=colors.HexColor("#0F172A"), spaceBefore=10, spaceAfter=6,
-    )
-    P = ParagraphStyle(
-        "P", parent=styles["BodyText"],
-        fontName="Helvetica", fontSize=10, leading=13,
-        textColor=colors.HexColor("#0F172A"),
-    )
-    SMALL = ParagraphStyle("SMALL", parent=P, fontSize=9, leading=12, textColor=colors.HexColor("#334155"))
-    MUTED = ParagraphStyle("MUTED", parent=P, fontSize=9, leading=12, textColor=colors.HexColor("#64748B"))
+    risk_color, risk_bg, risk_txt   = _risk_style(risk_level)
+    action_color, action_txt        = _action_style(action)
 
-    CARD_BG    = colors.HexColor("#111827")
-    CARD_BG_2  = colors.HexColor("#0B1220")
-    CARD_BORDER= colors.HexColor("#334155")
-    CARD_TEXT  = colors.white
-    CARD_MUTED = colors.HexColor("#C7D2FE")
-
-    CARD_H   = ParagraphStyle("CARD_H",   parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=12, leading=14, textColor=CARD_TEXT, spaceAfter=2)
-    CARD_SUB = ParagraphStyle("CARD_SUB", parent=P, fontSize=9, leading=12, textColor=colors.HexColor("#E5E7EB"))
-    CARD_TXT = ParagraphStyle("CARD_TXT", parent=P, fontSize=9, leading=12, textColor=colors.HexColor("#F3F4F6"))
-    CARD_SEC = ParagraphStyle("CARD_SEC", parent=P, fontName="Helvetica-Bold", fontSize=9, leading=12, textColor=CARD_MUTED, spaceAfter=2)
-
-    # --------------------------------------------------------------------------
-    # Document
-    # --------------------------------------------------------------------------
-    buf = BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=18 * mm, rightMargin=18 * mm,
-        topMargin=22 * mm,  bottomMargin=18 * mm,
-        title="Rapport de Screening", author="Simandou Screening",
-    )
-
+    ST    = _build_styles()
     story: list[Any] = []
 
-    # Logo
+    # ── Cover ──────────────────────────────────────────────────
+    logo_cell: Any = ""
     if DEFAULT_LOGO_PATH.exists():
         try:
-            logo = Image(str(DEFAULT_LOGO_PATH))
-            target_w = 48 * mm
-            iw, ih = float(logo.imageWidth), float(logo.imageHeight)
-            ratio = (ih / iw) if iw else 0.3
-            logo.drawWidth = target_w
-            logo.drawHeight = target_w * ratio
-            lt = Table([[logo]], colWidths=[doc.width])
-            lt.setStyle(TableStyle([
-                ("ALIGN", (0, 0), (0, 0), "CENTER"),
-                ("BOTTOMPADDING", (0, 0), (0, 0), 4),
-            ]))
-            story.append(lt)
+            logo    = Image(str(DEFAULT_LOGO_PATH))
+            tw      = 36 * mm
+            iw, ih  = float(logo.imageWidth), float(logo.imageHeight)
+            logo.drawWidth  = tw
+            logo.drawHeight = tw * (ih / iw if iw else 0.3)
+            logo_cell = logo
         except Exception:
             pass
 
-    story.append(Paragraph("Rapport de Screening", H1))
-    story.append(Paragraph(f"<b>Request ID:</b> {req_id_str} &nbsp;&nbsp; <b>Client ID:</b> {client_id}", MUTED))
-    if case_id:
-        story.append(Paragraph(f"<b>Case ID:</b> {case_id}", MUTED))
-    story.append(Spacer(1, 6 * mm))
-
-    # --------------------------------------------------------------------------
-    # Identité
-    # --------------------------------------------------------------------------
-    identity_rows = [
-        [Paragraph("<b>Identité screenée</b>", H2), ""],
-        [Paragraph("<b>Nom / Raison sociale</b>", SMALL), Paragraph(_as_text(full_name) or "-", P)],
-        [Paragraph("<b>Type</b>", SMALL), Paragraph(_as_text(entity_type) or "-", P)],
+    title_block = [
+        Paragraph("RAPPORT DE SCREENING", ST["title"]),
+        Paragraph(f"Request ID : {req_id_str}", ST["small"]),
+        Paragraph(f"Généré le : {created_at[:19] if created_at else '—'}", ST["small"]),
     ]
-    t = Table(identity_rows, colWidths=[48 * mm, 120 * mm])
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F1F5F9")),
-        ("SPAN", (0, 0), (1, 0)),
-        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#CBD5E1")),
-        ("INNERGRID", (0, 1), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    header_tbl = Table(
+        [[logo_cell, title_block]],
+        colWidths=[44 * mm, CONTENT_W - 44 * mm],
+    )
+    header_tbl.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+        ("TOPPADDING",    (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
     ]))
-    story.append(t)
-    story.append(Spacer(1, 6 * mm))
+    story.append(header_tbl)
+    story.append(HRFlowable(width=CONTENT_W, thickness=2, color=C_BLUE, spaceAfter=10))
 
-    # --------------------------------------------------------------------------
-    # Décision moteur
-    # --------------------------------------------------------------------------
-    story.append(Paragraph("Décision (moteur)", H2))
-    story.append(Paragraph(f"Risque : <font color='{risk_color.hexval()}'><b>{risk_txt}</b></font>", P))
-    story.append(Paragraph(f"Confiance : <b>{_as_text(confidence) if confidence is not None else '-'}</b>", P))
-    story.append(Paragraph(f"Action recommandée : <b>{_as_text(action) or '-'}</b>", P))
-    story.append(Paragraph(f"Décidé par : <b>{_as_text(decided_by) or '-'}</b>", P))
+    # ── KPI row ────────────────────────────────────────────────
+    story.append(_kpi_row([
+        {"label": "Risque",         "value": risk_txt,                                       "color": risk_color,   "bg": risk_bg},
+        {"label": "Action",         "value": action_txt,                                     "color": action_color},
+        {"label": "Confiance",      "value": f"{confidence}%" if confidence is not None else "—", "color": C_BLUE},
+        {"label": "Correspondances","value": str(len(matches)),                               "color": C_GRAY_DK},
+    ], ST))
+    story.append(Spacer(1, 8))
+
+    # ── Section 1 : Dossier ────────────────────────────────────
+    story.append(_section_header_table("1 — Informations du dossier", ST))
+    story.append(Spacer(1, 6))
+    story.append(_two_col_table([
+        ("Nom / Raison sociale", full_name),
+        ("Type d'entité",        entity_type),
+        ("Client ID",            client_id_v),
+        ("Case ID",              case_id or "—"),
+        ("Provider",             provider),
+        ("Statut",               status_v),
+        ("Créé le",              created_at[:19] if created_at else "—"),
+        ("Terminé le",           completed_at[:19] if completed_at else "—"),
+    ], ST))
+    story.append(Spacer(1, 10))
+
+    # ── Section 2 : Décision moteur ────────────────────────────
+    story.append(_section_header_table("2 — Décision du moteur de screening", ST))
+    story.append(Spacer(1, 6))
+    dec_rows: list[tuple[str, str]] = [
+        ("Niveau de risque",   risk_txt),
+        ("Confiance",          f"{confidence}%" if confidence is not None else "—"),
+        ("Action recommandée", action_txt),
+        ("Décidé par",         _as_text(getattr(res, "decided_by", "SYSTEM") if res else "SYSTEM")),
+    ]
     if notes:
-        story.append(Spacer(1, 2 * mm))
-        story.append(Paragraph(f"<b>Notes :</b> {_as_text(notes)}", P))
+        dec_rows.append(("Notes", notes))
+    story.append(_two_col_table(dec_rows, ST))
+    story.append(Spacer(1, 10))
 
-    # --------------------------------------------------------------------------
-    # Décision analyst
-    # --------------------------------------------------------------------------
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("Décision analyst (Bypass)", H2))
-
-    if latest_decision:
-        story.append(Paragraph(f"Décision : <b>{_as_text(latest_decision.get('decision'))}</b>", P))
-        story.append(Paragraph(f"Pris par : <b>{_as_text(latest_decision.get('decided_by_email'))}</b>", P))
-        story.append(Paragraph(f"Le : <b>{_as_text(latest_decision.get('decided_at'))}</b>", P))
-        cmt = _as_text(latest_decision.get("comment"))
-        story.append(Paragraph(f"Raison : {cmt if cmt else '-'}", P))
+    # ── Section 3 : Décision analyst ──────────────────────────
+    story.append(_section_header_table("3 — Décision analyst (Bypass)", ST))
+    story.append(Spacer(1, 6))
+    if latest_dec:
+        story.append(_two_col_table([
+            ("Décision",    _as_text(latest_dec.get("decision"))),
+            ("Analyste",    _as_text(latest_dec.get("decided_by_email"))),
+            ("Date",        _as_text(latest_dec.get("decided_at"))[:19] if latest_dec.get("decided_at") else "—"),
+            ("Commentaire", _as_text(latest_dec.get("comment")) or "—"),
+        ], ST))
+        if len(dec_history) > 1:
+            story.append(Paragraph(f"{len(dec_history) - 1} décision(s) antérieure(s).", ST["small"]))
     else:
-        story.append(Paragraph("Aucune décision analyst enregistrée.", P))
+        story.append(Paragraph("Aucune décision analyst enregistrée.", ST["body"]))
+    story.append(Spacer(1, 10))
 
-    # --------------------------------------------------------------------------
-    # Historique
-    # --------------------------------------------------------------------------
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("Historique des actions", H2))
+    # ── Section 4 : Tableau récap correspondances ──────────────
+    story.append(_section_header_table(f"4 — Correspondances trouvées ({len(matches)})", ST))
+    story.append(Spacer(1, 6))
 
-    created_at   = getattr(req, "created_at", None)
-    completed_at = getattr(req, "completed_at", None)
-    provider     = _coalesce(getattr(req, "provider", None), payload.get("provider"), default="-")
-    status       = _coalesce(getattr(req, "status", None), payload.get("status"), default="-")
-
-    events: list[tuple[str, str]] = [
-        ("Screening créé", _as_text(created_at) or "-"),
-        ("Provider", provider),
-        ("Statut", status),
-    ]
-    if completed_at:
-        events.append(("Screening terminé", _as_text(completed_at)))
-
-    docs_list = payload.get("documents") if isinstance(payload.get("documents"), list) else []
-    if docs_list:
-        d0 = docs_list[0] if isinstance(docs_list[0], dict) else None
-        if d0:
-            events.append(("Document upload",  _coalesce(d0.get("uploaded_at"), d0.get("created_at"), default="-")))
-            events.append(("OCR status",        _coalesce(d0.get("ocr_status"), default="-")))
-            events.append(("OCR confidence",    _coalesce(d0.get("ocr_confidence"), default="-")))
-
-    if latest_decision:
-        events.append((
-            "Décision analyst",
-            f"{_as_text(latest_decision.get('decision'))} — {_as_text(latest_decision.get('decided_at'))}",
-        ))
-
-    hist_rows = [[Paragraph("<b>Action</b>", SMALL), Paragraph("<b>Détail</b>", SMALL)]]
-    for a, d in events[:20]:
-        hist_rows.append([Paragraph(_as_text(a), SMALL), Paragraph(_safe_pre(_as_text(d), 300), SMALL)])
-
-    tbl = Table(hist_rows, colWidths=[50 * mm, 118 * mm])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#CBD5E1")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    story.append(tbl)
-
-    # --------------------------------------------------------------------------
-    # Correspondances (résumé)
-    # --------------------------------------------------------------------------
-    story.append(Spacer(1, 6 * mm))
-    story.append(Paragraph("Correspondances trouvées", H2))
-
-    header = [
-        Paragraph("<b>#</b>", SMALL),
-        Paragraph("<b>Nom</b>", SMALL),
-        Paragraph("<b>Catégorie</b>", SMALL),
-        Paragraph("<b>Réf</b>", SMALL),
-        Paragraph("<b>Programme</b>", SMALL),
-        Paragraph("<b>Score</b>", SMALL),
-    ]
-    match_rows = [header]
-
-    top = sorted(matches, key=lambda r: float(r.get("match_score") or 0), reverse=True)[:50]
-
-    if not top:
-        match_rows.append([
-            Paragraph("-", SMALL),
-            Paragraph("Aucune correspondance", SMALL),
-            Paragraph("-", SMALL), Paragraph("-", SMALL),
-            Paragraph("-", SMALL), Paragraph("-", SMALL),
-        ])
+    top_matches = matches[:50]
+    if not top_matches:
+        story.append(Paragraph("✓ Aucune correspondance détectée.", ST["body"]))
     else:
-        for i, r in enumerate(top, start=1):
-            ent = entities_by_id.get(str(r.get("entity_id") or ""))
-            sr  = source_records_by_id.get(str(r.get("source_record_id") or "")) if r.get("source_record_id") else None
-            band    = _normalize_band(r.get("match_band"))
-            ref     = _coalesce(getattr(sr, "source_ref", None), default="-")
-            program = _coalesce(getattr(sr, "program", None), default="-")
-            score   = int(float(r.get("match_score") or 0))
-            match_rows.append([
-                Paragraph(str(i), SMALL),
-                Paragraph(_coalesce(getattr(ent, "primary_name", None), default="-"), SMALL),
-                Paragraph(band, SMALL),
-                Paragraph(ref, SMALL),
-                Paragraph(program, SMALL),
-                Paragraph(f"{score}%", SMALL),
+        hdr = [
+            Paragraph("N°",        ST["label"]),
+            Paragraph("Entité",    ST["label"]),
+            Paragraph("Catégorie", ST["label"]),
+            Paragraph("Source",    ST["label"]),
+            Paragraph("Programme", ST["label"]),
+            Paragraph("Score",     ST["label"]),
+        ]
+        tbl_data = [hdr]
+        for i, r in enumerate(top_matches, 1):
+            ent   = entities.get(str(r.get("entity_id") or ""))
+            sr    = src_recs.get(str(r.get("source_record_id") or "")) if r.get("source_record_id") else None
+            sid   = int(getattr(sr, "source_id", 0) or 0) if sr else 0
+            scode = srcs_map.get(sid, {}).get("code") or SOURCE_FALLBACK.get(sid, "—")
+            score = int(round(float(r.get("match_score") or 0)))
+            sc    = C_RED if score >= 85 else C_ORANGE if score >= 70 else C_GRAY_MD
+            tbl_data.append([
+                Paragraph(str(i), ST["small"]),
+                Paragraph(_coalesce(getattr(ent, "primary_name", None), default="—"), ST["body"]),
+                Paragraph(_normalize_band(r.get("match_band")), ST["small"]),
+                Paragraph(scode, ST["small"]),
+                Paragraph(_coalesce(getattr(sr, "program", None), default="—"), ST["small"]),
+                Paragraph(f"<font color='{sc}'><b>{score}%</b></font>", ST["body"]),
             ])
 
-    tm = Table(match_rows, colWidths=[8 * mm, 42 * mm, 22 * mm, 30 * mm, 42 * mm, 16 * mm])
-    tm.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#CBD5E1")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    story.append(tm)
+        tm = Table(tbl_data, colWidths=[8 * mm, 50 * mm, 22 * mm, 18 * mm, 48 * mm, 14 * mm])
+        tm.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, 0),  C_NAVY),
+            ("TEXTCOLOR",     (0, 0), (-1, 0),  C_WHITE),
+            ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, 0),  8),
+            ("BOX",           (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("INNERGRID",     (0, 1), (-1, -1), 0.3, C_GRAY_LT),
+            ("ROWBACKGROUNDS",(0, 1), (-1, -1), [C_WHITE, C_GRAY_XL]),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(tm)
+    story.append(Spacer(1, 8))
 
-    # --------------------------------------------------------------------------
-    # Détails cards (seulement si matches)
-    # --------------------------------------------------------------------------
-    if top:
+    # ── Section 5 : Fiches détaillées ─────────────────────────
+    if top_matches:
         story.append(PageBreak())
-        story.append(Paragraph("Détails des correspondances (sanctions / décisions)", H1))
-        story.append(Spacer(1, 3 * mm))
+        story.append(_section_header_table("5 — Fiches détaillées des correspondances", ST))
+        story.append(Spacer(1, 8))
 
-        for idx, r in enumerate(top[:30], start=1):
-            ent = entities_by_id.get(str(r.get("entity_id") or ""))
-            sr  = source_records_by_id.get(str(r.get("source_record_id") or "")) if r.get("source_record_id") else None
-
-            score       = int(float(r.get("match_score") or 0))
-            band        = _normalize_band(r.get("match_band"))
-            ref         = _coalesce(getattr(sr, "source_ref", None), default="-")
-            program     = _coalesce(getattr(sr, "program", None), default="-")
-            record_type = _coalesce(getattr(sr, "record_type", None), default="-")
-            listed_on   = _coalesce(getattr(sr, "listed_on", None), default="-")
-            summary_sr  = _coalesce(getattr(sr, "summary", None), default="-")
-
+        for idx, r in enumerate(top_matches[:20], 1):
+            ent      = entities.get(str(r.get("entity_id") or ""))
+            sr       = src_recs.get(str(r.get("source_record_id") or "")) if r.get("source_record_id") else None
             sid      = int(getattr(sr, "source_id", 0) or 0) if sr else 0
-            src_code = sources_map.get(sid, {}).get("code") if sid else (SOURCE_FALLBACK.get(sid) if sid else None)
-            src_name = sources_map.get(sid, {}).get("name") if sid else None
-            src_label = _coalesce(src_name, src_code, default="-")
+            src_code = srcs_map.get(sid, {}).get("code") or SOURCE_FALLBACK.get(sid, "—")
+            src_name = srcs_map.get(sid, {}).get("name") or src_code
+            score    = int(float(r.get("match_score") or 0))
+            band     = _normalize_band(r.get("match_band"))
+            sc       = C_RED if score >= 85 else C_ORANGE if score >= 70 else C_GRAY_MD
+            name_txt = _coalesce(getattr(ent, "primary_name", None), default="Entité inconnue")
 
-            sanction_bullets = _extract_sanction_bullets(sr)
-            tech_bullets     = _humanize_match_reasons(r.get("reasons"))
-
-            links = getattr(sr, "evidence_urls", None) if sr else None
-            links = links if isinstance(links, list) else ([] if links is None else [links])
-            links = [str(x).strip() for x in links if x and str(x).strip()]
-
-            raw_excerpt = _extract_raw_excerpt(sr)
-
-            title_name  = _coalesce(getattr(ent, "primary_name", None), default="(Nom indisponible)")
-            subtitle    = f"Catégorie : {band} · Réf : {ref} · Programme : {program}"
-            score_badge = Paragraph(
-                f"<b>Score : {score}%</b>",
-                ParagraphStyle("SCORE", parent=CARD_TXT, textColor=colors.HexColor("#FCA5A5")),
-            )
-
-            header_tbl = Table(
-                [[Paragraph(title_name.upper(), CARD_H), score_badge]],
-                colWidths=[doc.width - 28 * mm, 28 * mm],
-            )
-            header_tbl.setStyle(TableStyle([
-                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-                ("ALIGN",         (1, 0), (1, 0),   "RIGHT"),
+            card_header = Table([[
+                Paragraph(
+                    f"{idx}. {name_txt}",
+                    ParagraphStyle(f"ch{idx}", fontName="Helvetica-Bold", fontSize=10,
+                                   textColor=C_WHITE, leading=13),
+                ),
+                Paragraph(
+                    f"Score : <b>{score}%</b>",
+                    ParagraphStyle(f"cs{idx}", fontName="Helvetica-Bold", fontSize=9,
+                                   textColor=sc,
+                                   leading=12, alignment=TA_RIGHT),
+                ),
+            ]], colWidths=[CONTENT_W - 30 * mm, 30 * mm])
+            card_header.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), C_DARK),
                 ("LEFTPADDING",   (0, 0), (-1, -1), 8),
                 ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
                 ("TOPPADDING",    (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                ("BACKGROUND",    (0, 0), (-1, -1), CARD_BG),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
             ]))
 
-            body: list[Any] = [
-                header_tbl,
-                Paragraph(subtitle, CARD_SUB),
-                Spacer(1, 3 * mm),
-                Paragraph("MOTIFS / RAISONS (SANCTION / DÉCISION)", CARD_SEC),
-            ]
-            if sanction_bullets:
-                for b in sanction_bullets:
-                    body.append(Paragraph(f"• {b}", CARD_TXT))
-            else:
-                body.append(Paragraph("• (Aucun motif détaillé disponible)", CARD_TXT))
+            meta_str  = f"Catégorie : {band}  |  Source : {src_name}  |  Programme : {_coalesce(getattr(sr, 'program', None), default='—')}"
+            lo        = getattr(sr, "listed_on", None)
+            if lo:
+                meta_str += f"  |  Inscrit le : {lo}"
+            meta_row  = Table([[Paragraph(meta_str, ST["small"])]], colWidths=[CONTENT_W])
+            meta_row.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), C_BLUE_LT),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+                ("TOPPADDING",    (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
 
-            body += [
-                Spacer(1, 3 * mm),
-                Paragraph("SOURCE OFFICIELLE", CARD_SEC),
-                Paragraph(f"<b>Source :</b> {src_label}", CARD_TXT),
-                Paragraph(f"<b>Type :</b> {record_type}", CARD_TXT),
-                Paragraph(f"<b>Inscrit le :</b> {listed_on}", CARD_TXT),
-            ]
-            if summary_sr and summary_sr != "-":
-                body.append(Paragraph(f"<b>Résumé :</b> {summary_sr}", CARD_TXT))
+            body_items: list[Any] = []
+            sanc = _sanction_bullets(sr)
+            body_items.append(
+                Paragraph("Motifs / Raisons :", ParagraphStyle(
+                    f"bl{idx}", fontName="Helvetica-Bold", fontSize=8.5,
+                    textColor=C_DARK, leading=11, spaceBefore=4))
+            )
+            for b in (sanc or ["Aucun motif détaillé disponible."]):
+                body_items.append(Paragraph(f"• {b}", ST["bullet"]))
 
-            if links:
-                body.append(Paragraph("<b>Liens (preuves) :</b>", CARD_TXT))
-                for url in links[:8]:
-                    body.append(Paragraph(f"• <link href='{url}' color='#93C5FD'>{url}</link>", CARD_TXT))
-            else:
-                body.append(Paragraph("<b>Liens (preuves) :</b> -", CARD_TXT))
+            body_items.append(Spacer(1, 4))
+            body_items.append(
+                Paragraph("Raisons techniques (matching) :", ParagraphStyle(
+                    f"bl2{idx}", fontName="Helvetica-Bold", fontSize=8.5,
+                    textColor=C_DARK, leading=11, spaceBefore=4))
+            )
+            for b in _humanize_reasons(r.get("reasons"))[:6]:
+                body_items.append(Paragraph(f"• {b}", ST["bullet"]))
 
-            body += [
-                Spacer(1, 3 * mm),
-                Paragraph("POURQUOI CE MATCH (TECHNIQUE)", CARD_SEC),
-            ]
-            for b in (tech_bullets or ["Correspondance détectée par le moteur."]):
-                body.append(Paragraph(f"• {b}", CARD_TXT))
+            links = getattr(sr, "evidence_urls", None) if sr else None
+            if isinstance(links, list) and links:
+                body_items.append(Spacer(1, 4))
+                body_items.append(
+                    Paragraph("Liens (preuves) :", ParagraphStyle(
+                        f"bl3{idx}", fontName="Helvetica-Bold", fontSize=8.5,
+                        textColor=C_DARK, leading=11))
+                )
+                for url in links[:4]:
+                    body_items.append(
+                        Paragraph(
+                            f"<link href='{url}' color='#2D7FD6'>• {url[:80]}{'…' if len(url) > 80 else ''}</link>",
+                            ST["small"],
+                        )
+                    )
 
-            if raw_excerpt is not None:
-                body += [
-                    Spacer(1, 2 * mm),
-                    Paragraph("DÉTAILS BRUTS (SOURCE / SANCTION)", CARD_SEC),
-                    Paragraph(_safe_pre(_as_text(raw_excerpt), limit=1200).replace("\n", "<br/>"), CARD_TXT),
-                ]
-
-            card_tbl = Table([[body]], colWidths=[doc.width])
-            card_tbl.setStyle(TableStyle([
-                ("BACKGROUND",    (0, 0), (-1, -1), CARD_BG_2),
-                ("BOX",           (0, 0), (-1, -1), 1.0, CARD_BORDER),
-                ("LEFTPADDING",   (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+            body_tbl = Table([[body_items]], colWidths=[CONTENT_W])
+            body_tbl.setStyle(TableStyle([
+                ("BOX",           (0, 0), (-1, -1), 0.5, C_BORDER),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
                 ("TOPPADDING",    (0, 0), (-1, -1), 6),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
             ]))
+            story.append(KeepTogether([card_header, meta_row, body_tbl, Spacer(1, 8)]))
 
-            story.append(card_tbl)
-            story.append(Spacer(1, 5 * mm))
+    # ── Section 6 : Historique décisions ──────────────────────
+    if len(dec_history) > 1:
+        story.append(Spacer(1, 6))
+        story.append(_section_header_table(f"6 — Historique des décisions ({len(dec_history)})", ST))
+        story.append(Spacer(1, 6))
+        hist_data = [[Paragraph(h, ST["label"]) for h in ["Décision", "Analyste", "Date", "Commentaire"]]]
+        for d in dec_history[:20]:
+            hist_data.append([
+                Paragraph(_as_text(d.get("decision")), ST["body"]),
+                Paragraph(_as_text(d.get("decided_by_email")), ST["body"]),
+                Paragraph((_as_text(d.get("decided_at")) or "")[:16], ST["small"]),
+                Paragraph((_as_text(d.get("comment")) or "—")[:120], ST["body"]),
+            ])
+        ht = Table(hist_data, colWidths=[22 * mm, 42 * mm, 28 * mm, CONTENT_W - 92 * mm])
+        ht.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, 0),  C_NAVY),
+            ("TEXTCOLOR",     (0, 0), (-1, 0),  C_WHITE),
+            ("BOX",           (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("INNERGRID",     (0, 1), (-1, -1), 0.3, C_GRAY_LT),
+            ("ROWBACKGROUNDS",(0, 1), (-1, -1), [C_WHITE, C_GRAY_XL]),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(ht)
 
-    title = "Rapport de Screening"
-    doc.build(
-        story,
-        onFirstPage=lambda canv, d: _header_footer(canv, d, title),
-        onLaterPages=lambda canv, d: _header_footer(canv, d, title),
+    # ── Build ──────────────────────────────────────────────────
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=MARGIN,  rightMargin=MARGIN,
+        topMargin=16 * mm,  bottomMargin=14 * mm,
+        title="Rapport de Screening", author="Simandou Screening",
     )
+    hf = _make_header_footer("Rapport de Screening", req_id_str)
+    doc.build(story, onFirstPage=hf, onLaterPages=hf)
     return buf.getvalue()

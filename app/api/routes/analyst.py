@@ -22,7 +22,7 @@ from app.models.screening_db import (
     ScreeningResult,
     SourceRecord,
 )
-from app.services.export_pdf_service import _load_analyst_decisions
+
 
 router = APIRouter(
     prefix="/analyst",
@@ -510,23 +510,28 @@ def _load_case_decisions(db: Session, case_id: str | None, request_id: str | Non
 # Routes
 # -----------------------------------------------------------------------------
 
+# Remplacement de la route GET /analyst/screenings dans analyst.py
+# Copier/coller ce bloc pour remplacer la fonction list_screenings existante
+
 @router.get("/screenings")
 def list_screenings(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     status: str | None = None,
     provider: str | None = None,
-    name: str | None = None,   # compat front (pas forcément filtrable en SQL)
+    name: str | None = None,
     kind: str | None = None,
     db: Session = Depends(get_db),
+    
 ):
     """
     Retour paginé compatible front:
       { items: [...], limit, offset, total }
+    Inclut désormais risk_level + matches_count depuis screening_results / screening_matches.
     """
     base = db.query(ScreeningRequest)
 
-    can_filter_status = hasattr(ScreeningRequest, "status")
+    can_filter_status   = hasattr(ScreeningRequest, "status")
     can_filter_provider = hasattr(ScreeningRequest, "provider")
 
     if status and can_filter_status:
@@ -544,17 +549,14 @@ def list_screenings(
     )
 
     def _keep(r: ScreeningRequest) -> bool:
-        if status and _get_status(r) != status:
-            return False
-        if provider and _get_provider(r) != provider:
-            return False
-        if kind and _get_kind(r) != kind:
-            return False
+        if status   and _get_status(r)   != status:   return False
+        if provider and _get_provider(r) != provider: return False
+        if kind     and _get_kind(r)     != kind:     return False
         if name:
             payload = _get_payload(r)
             nm = (_safe_str(payload.get("override_name")) or _safe_str(payload.get("name")) or "")
             fn = _safe_str(payload.get("first_name") or payload.get("firstName")) or ""
-            ln = _safe_str(payload.get("last_name") or payload.get("lastName")) or ""
+            ln = _safe_str(payload.get("last_name")  or payload.get("lastName"))  or ""
             full = f"{fn} {ln}".strip()
             cand = (nm or full).lower()
             if name.lower().strip() not in cand:
@@ -565,19 +567,22 @@ def list_screenings(
 
     # total réel si filtres python
     total = total_base
-    python_filters_active = bool(kind or name or (status and not can_filter_status) or (provider and not can_filter_provider))
+    python_filters_active = bool(
+        kind or name
+        or (status   and not can_filter_status)
+        or (provider and not can_filter_provider)
+    )
     if python_filters_active:
         cap = 4000
         scan_rows: list[ScreeningRequest] = (
             base.order_by(desc(getattr(ScreeningRequest, "created_at")))
-            .limit(cap)
-            .all()
+            .limit(cap).all()
         )
         total = len([r for r in scan_rows if _keep(r)])
         if total_base > cap:
             total = max(total, min(total_base, cap))
 
-    # bulk cases
+    # ── Bulk: cases ──────────────────────────────────────────────────
     case_ids: list[str] = []
     for r in rows:
         cid = _get_req_case_id(r)
@@ -589,11 +594,62 @@ def list_screenings(
         cases = db.query(Case).filter(Case.id.in_(case_ids)).all()
         cases_by_id = {str(c.id): c for c in cases}
 
+    # ── Bulk: screening_results (risk_level + confidence + recommended_action) ──
+    request_ids = [getattr(r, "id") for r in rows]
+    results_by_request_id: dict[str, dict] = {}
+    if request_ids:
+        try:
+            res_rows = db.execute(
+                text("""
+                    SELECT
+                        request_id::text AS request_id,
+                        risk_level,
+                        confidence,
+                        recommended_action
+                    FROM public.screening_results
+                    WHERE request_id = ANY(CAST(:ids AS uuid[]))
+                """),
+                {"ids": [str(rid) for rid in request_ids]},
+            ).mappings().all()
+            for rr in res_rows:
+                results_by_request_id[rr["request_id"]] = dict(rr)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    # ── Bulk: matches count per request ──────────────────────────────
+    matches_count_by_id: dict[str, int] = {}
+    if request_ids:
+        try:
+            mc_rows = db.execute(
+                text("""
+                    SELECT
+                        request_id::text AS request_id,
+                        COUNT(*) AS cnt
+                    FROM public.screening_matches
+                    WHERE request_id = ANY(CAST(:ids AS uuid[]))
+                    GROUP BY request_id
+                """),
+                {"ids": [str(rid) for rid in request_ids]},
+            ).mappings().all()
+            for mc in mc_rows:
+                matches_count_by_id[mc["request_id"]] = int(mc["cnt"])
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    # ── Build items ───────────────────────────────────────────────────
     items = []
     for r in rows:
-        payload = _get_payload(r)
-        cid = _get_req_case_id(r)
-        c = cases_by_id.get(cid) if cid else None
+        payload  = _get_payload(r)
+        cid      = _get_req_case_id(r)
+        c        = cases_by_id.get(cid) if cid else None
+        rid_str  = str(getattr(r, "id"))
+        result   = results_by_request_id.get(rid_str, {})
 
         client_name = (
             _case_display_name(c)
@@ -602,24 +658,46 @@ def list_screenings(
             or _client_name_from_payload(payload)
         )
 
-        items.append(
-            {
-                "id": str(getattr(r, "id")),
-                "provider": _get_provider(r),
-                "status": _get_status(r),
-                "created_at": getattr(r, "created_at", None),
-                "completed_at": getattr(r, "completed_at", None),
-                "case_id": cid,
-                "kind": _get_kind(r),
-                "client_name": client_name,
-            }
-        )
+        items.append({
+            "id":                rid_str,
+            "provider":          _get_provider(r),
+            "status":            _get_status(r),
+            "created_at":        getattr(r, "created_at", None),
+            "completed_at":      getattr(r, "completed_at", None),
+            "case_id":           cid,
+            "kind":              _get_kind(r),
+            "client_name":       client_name,
+            # ✅ nouveaux champs
+            "risk_level":        result.get("risk_level"),
+            "confidence":        result.get("confidence"),
+            "recommended_action":result.get("recommended_action"),
+            "matches_count":     matches_count_by_id.get(rid_str, 0),
+        })
 
     return {"items": items, "limit": limit, "offset": offset, "total": total}
 
-
 @router.get("/screenings/{request_id}", response_model=ScreeningDetailsOut)
-def screening_details(request_id: str, db: Session = Depends(get_db)):
+def screening_details(
+    request_id: str,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    # ✅ FIX: reset + tenant context
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    try:
+        if isinstance(user, dict):
+            _tid = user.get("tenant_id") or user.get("effective_tenant_id")
+        else:
+            _tid = getattr(user, "tenant_id", None) or getattr(user, "effective_tenant_id", None)
+        if _tid:
+            from app.core.db import set_tenant_context
+            set_tenant_context(db, str(_tid))
+    except Exception:
+        pass
+ 
     rid = _as_uuid(request_id, "request_id")
 
     # ✅ 1) request en dict (pas ORM)
