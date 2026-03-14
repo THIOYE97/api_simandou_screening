@@ -280,3 +280,20 @@ def get_document_file(
     headers  = {"Content-Disposition": f'{disp}; filename="{filename}"'}
 
     return StreamingResponse(iter([blob]), media_type=mime, headers=headers)
+
+
+
+@router.get("/{doc_id}/status")
+def get_document_status(doc_id: UUID, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    try:
+        doc = get_document(db, doc_id)
+    except (ValueError, HTTPException):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "doc_id":          str(doc.id),
+        # ✅ .value retourne "DONE" au lieu de "OCRStatus.DONE"
+        "ocr_status":      doc.ocr_status.value if hasattr(doc.ocr_status, "value") else str(doc.ocr_status),
+        "ocr_confidence":  float(doc.ocr_confidence) if doc.ocr_confidence is not None else None,
+        "extracted_fields": doc.extracted_fields or {},
+    }

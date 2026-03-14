@@ -1,6 +1,7 @@
 # app/api/routes/screening.py
 from __future__ import annotations
 
+import traceback as tb
 from uuid import UUID
 from typing import Any, Optional
 
@@ -115,7 +116,7 @@ def _pick_case_status(db: Session) -> str:
 
 def _create_case_minimal(db: Session, created_by: str) -> str:
     case_type = _pick_case_type(db)
-    status = _pick_case_status(db)
+    status    = _pick_case_status(db)
     row = db.execute(
         text("""
             INSERT INTO cases (case_type, created_by, status, created_at, updated_at)
@@ -139,7 +140,7 @@ def _build_name(extracted: dict) -> str:
     if full:
         return full
     first = (extracted.get("first_name") or "").strip()
-    last = (extracted.get("last_name") or "").strip()
+    last  = (extracted.get("last_name")  or "").strip()
     return " ".join([first, last]).strip()
 
 
@@ -157,7 +158,7 @@ def _case_exists(db: Session, case_id: str) -> bool:
 # ─── Schemas ──────────────────────────────────────────────────────────────────
 
 class SimpleScreeningIn(BaseModel):
-    entity_type: str  # "INDIVIDUAL" | "COMPANY"
+    entity_type: str
     case_id: Optional[str] = None
     client_id: Optional[str] = None
     first_name: Optional[str] = None
@@ -182,8 +183,6 @@ def screening_simple(
     user=Depends(get_current_user),
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
 ):
-    import traceback
-
     try:
         _require_tenant_id(user)
         created_by = _require_user_id(user)
@@ -208,7 +207,6 @@ def screening_simple(
         if not name:
             raise HTTPException(422, "Missing name/company_name")
 
-        # Resolve case_id
         if payload.case_id and str(payload.case_id).strip():
             candidate = str(payload.case_id).strip()
             if not _case_exists(db, candidate):
@@ -219,9 +217,11 @@ def screening_simple(
                 case_id = _create_case_minimal(db, created_by)
                 db.commit()
                 set_tenant_context(db, tenant_id)
+            except HTTPException:
+                raise
             except Exception as e:
                 db.rollback()
-                print("[SCREENING/SIMPLE] _create_case_minimal FAILED:", traceback.format_exc())
+                print("[SCREENING/SIMPLE] _create_case_minimal FAILED:", tb.format_exc())
                 raise HTTPException(500, f"Failed to create case: {e}")
 
         meta = {
@@ -249,12 +249,9 @@ def screening_simple(
                 meta=meta,
             )
         except Exception as e:
-            print("[SCREENING/SIMPLE] run_simple_screening FAILED:", traceback.format_exc())
+            print("[SCREENING/SIMPLE] run_simple_screening FAILED:", tb.format_exc())
             raise HTTPException(500, f"Screening engine error: {e}")
 
-        # ✅ FIX: UPDATE screening_requests avec rollback safe
-        # run_simple_screening peut laisser la session en état "aborted"
-        # sur les HIGH RISK screenings → rollback + re-poser tenant context
         request_id = _extract_request_id(out)
         if request_id:
             try:
@@ -263,7 +260,6 @@ def screening_simple(
                 except Exception:
                     pass
                 set_tenant_context(db, tenant_id)
-
                 db.execute(
                     text("""
                         UPDATE screening_requests
@@ -272,11 +268,7 @@ def screening_simple(
                             client_id = COALESCE(client_id, :client_id)
                         WHERE id = CAST(:rid AS uuid)
                     """),
-                    {
-                        "case_id":   case_id,
-                        "client_id": payload.client_id,
-                        "rid":       str(request_id),
-                    },
+                    {"case_id": case_id, "client_id": payload.client_id, "rid": str(request_id)},
                 )
                 db.commit()
             except Exception as e:
@@ -288,7 +280,7 @@ def screening_simple(
     except HTTPException:
         raise
     except Exception as e:
-        print("[SCREENING/SIMPLE] UNEXPECTED ERROR:", traceback.format_exc())
+        print("[SCREENING/SIMPLE] UNEXPECTED ERROR:", tb.format_exc())
         raise HTTPException(500, f"Unexpected error: {e}")
 
 
@@ -298,10 +290,8 @@ def analyst_check(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    tenant_id = _require_tenant_id(user)
+    tenant_id  = _require_tenant_id(user)
     created_by = _require_user_id(user)
-
-    # 🔴 IMPORTANT
     set_tenant_context(db, tenant_id)
 
     out = run_simple_screening(
@@ -309,12 +299,8 @@ def analyst_check(
         name=payload.name,
         client_id=payload.client_id,
         country_focus=payload.country_focus,
-        meta={
-            "trigger": "analyst.screenings.check",
-            "created_by": created_by,
-        },
+        meta={"trigger": "analyst.screenings.check", "created_by": created_by},
     )
-
     return ScreeningCheckOut(**out)
 
 
@@ -331,63 +317,84 @@ def screening_from_document(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    tenant_id = _require_tenant_id(user)
-    set_tenant_context(db, tenant_id)
-    created_by = _require_user_id(user)
-    
-
-    doc = db.query(Document).filter(Document.id == payload.document_id).one_or_none()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    if doc.ocr_status not in (OCRStatus.DONE, OCRStatus.LOW_CONFIDENCE):
-        raise HTTPException(
-            status_code=409,
-            detail="OCR not completed. Call /documents/{id}/extract first.",
-        )
-
-    if doc.case_id:
-        case_id = str(doc.case_id)
-    else:
-        try:
-            case_id = _create_case_minimal(db, created_by)
-            db.execute(
-                text("UPDATE documents SET case_id = :cid WHERE id = :did"),
-                {"cid": case_id, "did": str(doc.id)},
-            )
-            db.commit()
-            db.refresh(doc)
-        except Exception as e:
-            db.rollback()
-            raise HTTPException(500, f"Failed to create/attach case: {e}")
-
     try:
-        apply_ocr_prefill_to_case(
+        tenant_id  = _require_tenant_id(user)
+        created_by = _require_user_id(user)
+        set_tenant_context(db, tenant_id)
+
+        doc = db.query(Document).filter(Document.id == payload.document_id).one_or_none()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if doc.ocr_status not in (OCRStatus.DONE, OCRStatus.LOW_CONFIDENCE):
+            raise HTTPException(
+                status_code=409,
+                detail=f"OCR not completed (status={doc.ocr_status}). Call /documents/{{id}}/extract first.",
+            )
+
+        # Résoudre ou créer le case
+        if doc.case_id:
+            case_id = str(doc.case_id)
+        else:
+            try:
+                case_id = _create_case_minimal(db, created_by)
+                db.execute(
+                    text("UPDATE documents SET case_id = CAST(:cid AS uuid) WHERE id = CAST(:did AS uuid)"),
+                    {"cid": case_id, "did": str(doc.id)},
+                )
+                db.commit()
+                # ✅ FIX: re-poser le tenant context après commit (connection peut changer)
+                set_tenant_context(db, tenant_id)
+                db.refresh(doc)
+            except HTTPException:
+                raise
+            except Exception as e:
+                db.rollback()
+                print("[FROM-DOC] _create_case_minimal FAILED:", tb.format_exc())
+                raise HTTPException(500, f"Failed to create/attach case: {e}")
+
+        # Prefill du case (non-bloquant)
+        try:
+            apply_ocr_prefill_to_case(
+                db=db,
+                case_id=case_id,
+                extracted_fields=doc.extracted_fields or {},
+                overwrite=False,
+            )
+        except Exception:
+            print("[FROM-DOC] apply_ocr_prefill_to_case failed (non-bloquant):", tb.format_exc())
+            db.rollback()
+
+        # ✅ FIX CRITIQUE: re-poser le tenant context après le rollback éventuel du prefill
+        # Sans ça, run_simple_screening lève RuntimeError: "tenant context missing"
+        set_tenant_context(db, tenant_id)
+
+        name = (payload.override_name or "").strip() or _build_name(doc.extracted_fields or {})
+        if not name:
+            raise HTTPException(status_code=422, detail="No name extracted. Provide override_name.")
+
+        print(f"[FROM-DOC] name={name!r} case_id={case_id} doc_id={doc.id} tenant={tenant_id}")
+
+        out = run_simple_screening(
             db=db,
-            case_id=case_id,
-            extracted_fields=doc.extracted_fields or {},
-            overwrite=False,
+            name=name,
+            client_id=payload.client_id,
+            country_focus=payload.country_focus,
+            meta={
+                "trigger":     "screening.from_document",
+                "document_id": str(doc.id),
+                "case_id":     case_id,
+                "created_by":  created_by,
+            },
         )
-    except Exception:
-        db.rollback()
+        return ScreeningCheckOut(**out)
 
-    name = (payload.override_name or "").strip() or _build_name(doc.extracted_fields or {})
-    if not name:
-        raise HTTPException(status_code=422, detail="No name extracted. Provide override_name.")
-
-    out = run_simple_screening(
-        db=db,
-        name=name,
-        client_id=payload.client_id,
-        country_focus=payload.country_focus,
-        meta={
-            "trigger": "screening.from_document",
-            "document_id": str(doc.id),
-            "case_id": case_id,
-            "created_by": created_by,
-        },
-    )
-    return ScreeningCheckOut(**out)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # ✅ FIX: log le vrai traceback — plus de 500 silencieux
+        print("[FROM-DOC] UNEXPECTED ERROR:", tb.format_exc())
+        raise HTTPException(500, f"screening_from_document error: {e}")
 
 
 @router.get("/{request_id}/export.json")
@@ -412,11 +419,11 @@ def export_screening_json(
             "request_payload": req.request_payload,
         },
         "result": None if not res else {
-            "risk_level":          res.risk_level,
-            "confidence":          res.confidence,
-            "recommended_action":  res.recommended_action,
-            "decided_by":          res.decided_by,
-            "notes":               res.notes,
+            "risk_level":         res.risk_level,
+            "confidence":         res.confidence,
+            "recommended_action": res.recommended_action,
+            "decided_by":         res.decided_by,
+            "notes":              res.notes,
         },
         "matches": [
             {
@@ -441,31 +448,16 @@ def export_pdf(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    tenant_id = _tenant_id(user)
+    tenant_id = _require_tenant_id(user)
+    set_tenant_context(db, tenant_id)
 
     try:
-        if db.in_transaction():
-            db.rollback()
-    except Exception:
-        pass
-
-    if tenant_id:
-        set_tenant_context(db, tenant_id)
-
-    try:
-        pdf_bytes = build_screening_pdf(
-            db,
-            str(request_id),
-            tenant_id=tenant_id,   # ⭐ IMPORTANT
-        )
-
+        # ✅ FIX: build_screening_pdf ne prend PAS tenant_id en paramètre
+        pdf_bytes = build_screening_pdf(db, str(request_id))
     except ValueError as e:
-        print("[PDF VALUE ERROR]", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        import traceback
-        print("[export_pdf] ERROR:", traceback.format_exc())
+        print("[export_pdf] ERROR:", tb.format_exc())
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
 
     return Response(

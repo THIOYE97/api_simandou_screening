@@ -302,4 +302,12 @@ def extract_document_fields_local(db: Session, doc_id: UUID) -> Document:
         )
     )
     db.commit()
-    return get_document(db, doc_id)
+
+    # ❌ db.refresh(doc) — échoue car tenant context resetté après commit
+    # return get_document(db, doc_id) — idem, RLS bloque
+
+    # ✅ Met à jour l'objet en mémoire directement, zéro SELECT
+    doc.extracted_fields = result.fields or {}
+    doc.ocr_confidence   = result.confidence
+    doc.ocr_status       = new_status
+    return doc
