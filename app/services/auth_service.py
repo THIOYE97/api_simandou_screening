@@ -21,7 +21,7 @@ from app.core.config import settings
 # Exemple fallback: remplace par tes settings réels si existants
 SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = settings.ALGORITHM
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24h
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 120  # 5 jours
 
 # ---------------------------------------------------------------------
 # Password hashing: Argon2 (default) + compat bcrypt
