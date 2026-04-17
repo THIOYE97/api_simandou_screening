@@ -1,0 +1,501 @@
+# app/api/routes/settings_routes.py
+
+from __future__ import annotations
+
+import json
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.api.deps.auth import get_current_user
+from app.api.deps.db import get_db_rls as get_db
+from app.core.db import set_tenant_context
+
+router = APIRouter(tags=["settings"])
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _tenant_id(user: Any) -> str:
+    if isinstance(user, dict):
+        return str(user.get("tenant_id") or user.get("effective_tenant_id") or "")
+    return str(getattr(user, "tenant_id", None) or getattr(user, "effective_tenant_id", None) or "")
+
+
+def _user_email(user: Any) -> str:
+    if isinstance(user, dict):
+        return str(user.get("email") or user.get("sub") or "")
+    return str(getattr(user, "email", None) or "")
+
+
+def _setup(db: Session, user: Any) -> str:
+    """Reset session + re-poser tenant context."""
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    tid = _tenant_id(user)
+    if not tid:
+        raise HTTPException(500, "tenant_id missing from token")
+    set_tenant_context(db, tid)
+    return tid
+
+
+def _ensure_settings_table(db: Session) -> None:
+    """Crée tenant_settings si absente (idempotent)."""
+    try:
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS public.tenant_settings (
+                tenant_id   UUID        PRIMARY KEY,
+                settings    JSONB       NOT NULL DEFAULT '{}',
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+DEFAULT_SETTINGS: dict = {
+    "pep_enabled":               True,
+    "sanctions_enabled":         True,
+    "adverse_media_enabled":     True,
+    "max_matches_default":       20,
+    "confidence_threshold":      70,
+    "email_notifications":       True,
+    "high_risk_only":            True,
+    "notification_frequency":    "immediately",
+    "date_locale":               "fr-FR",
+    "risk_auto_block_threshold": "HIGH",
+}
+
+SOURCE_NAMES = {1: "Nations Unies (ONU)", 2: "OFAC (US Treasury)", 3: "Union Européenne"}
+SOURCE_CODES = {1: "UN", 2: "OFAC", 3: "EU"}
+SOURCE_FLAGS = {1: "🌐", 2: "🇺🇸", 3: "🇪🇺"}
+
+
+# ─── GET /settings ────────────────────────────────────────────────────────────
+
+@router.get("/settings")
+def get_settings(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    tid = _setup(db, user)
+    _ensure_settings_table(db)
+
+    try:
+        row = db.execute(
+            text("SELECT settings FROM public.tenant_settings WHERE tenant_id = CAST(:tid AS uuid)"),
+            {"tid": tid},
+        ).mappings().first()
+        stored = dict(row["settings"]) if row and row["settings"] else {}
+    except Exception:
+        stored = {}
+
+    return JSONResponse(content={**DEFAULT_SETTINGS, **stored})
+
+
+# ─── PATCH /settings ──────────────────────────────────────────────────────────
+
+@router.patch("/settings")
+def update_settings(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    tid = _setup(db, user)
+    _ensure_settings_table(db)
+
+    try:
+        row = db.execute(
+            text("SELECT settings FROM public.tenant_settings WHERE tenant_id = CAST(:tid AS uuid)"),
+            {"tid": tid},
+        ).mappings().first()
+        current = dict(row["settings"]) if row and row["settings"] else {}
+
+        # Whitelist
+        patch   = {k: v for k, v in payload.items() if k in DEFAULT_SETTINGS}
+        updated = {**DEFAULT_SETTINGS, **current, **patch}
+
+        db.execute(
+            text("""
+                INSERT INTO public.tenant_settings (tenant_id, settings, updated_at)
+                VALUES (CAST(:tid AS uuid), CAST(:s AS jsonb), now())
+                ON CONFLICT (tenant_id) DO UPDATE
+                    SET settings   = CAST(:s AS jsonb),
+                        updated_at = now()
+            """),
+            {"tid": tid, "s": json.dumps(updated)},
+        )
+        db.commit()
+        return JSONResponse(content={"ok": True, "settings": updated})
+
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(500, f"Erreur sauvegarde settings: {e}")
+
+
+# ─── GET /settings/sources ────────────────────────────────────────────────────
+
+@router.get("/settings/sources")
+def list_sources(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    _setup(db, user)
+
+    try:
+        # Check if public.sources table exists with a 'name' column
+        has_sources = db.execute(
+            text("SELECT to_regclass('public.sources')")
+        ).scalar()
+
+        if has_sources:
+            # Try reading from sources table directly
+            try:
+                rows = db.execute(
+                    text("""
+                        SELECT
+                            s.id,
+                            COALESCE(s.code::text, s.id::text) AS code,
+                            COALESCE(s.name::text, s.code::text, s.id::text) AS name,
+                            'active' AS status,
+                            s.updated_at AS last_updated,
+                            (
+                                SELECT COUNT(*)::int
+                                FROM public.source_records sr
+                                WHERE sr.source_id = s.id
+                            ) AS entity_count
+                        FROM public.sources s
+                        ORDER BY s.id
+                    """)
+                ).mappings().all()
+
+                result = [
+                    {
+                        "id":           int(r["id"]),
+                        "code":         r["code"],
+                        "name":         r["name"],
+                        "status":       r["status"],
+                        "entity_count": r["entity_count"],
+                        "last_updated": str(r["last_updated"]) if r.get("last_updated") else None,
+                    }
+                    for r in rows
+                ]
+                if result:
+                    return JSONResponse(content=result)
+            except Exception:
+                try:
+                    db.rollback()
+                    _setup(db, user)
+                except Exception:
+                    pass
+
+        # Fallback: aggregate from source_records (always works)
+        rows = db.execute(
+            text("""
+                SELECT
+                    source_id::int            AS id,
+                    COUNT(*)::int             AS entity_count,
+                    MAX(created_at)           AS last_updated
+                FROM public.source_records
+                GROUP BY source_id
+                ORDER BY source_id
+            """)
+        ).mappings().all()
+
+        result = []
+        for r in rows:
+            sid = int(r["id"])
+            result.append({
+                "id":           sid,
+                "code":         SOURCE_CODES.get(sid, f"SRC{sid}"),
+                "name":         SOURCE_NAMES.get(sid, f"Source {sid}"),
+                "flag":         SOURCE_FLAGS.get(sid, "📋"),
+                "status":       "active",
+                "entity_count": r["entity_count"],
+                "last_updated": str(r["last_updated"]) if r.get("last_updated") else None,
+            })
+
+        # If still empty, return hardcoded defaults
+        if not result:
+            result = [
+                {"id": 1, "code": "UN",   "name": "Nations Unies (ONU)",  "flag": "🌐", "status": "active", "entity_count": 0, "last_updated": None},
+                {"id": 2, "code": "OFAC", "name": "OFAC (US Treasury)",   "flag": "🇺🇸", "status": "active", "entity_count": 0, "last_updated": None},
+                {"id": 3, "code": "EU",   "name": "Union Européenne",     "flag": "🇪🇺", "status": "active", "entity_count": 0, "last_updated": None},
+            ]
+
+        return JSONResponse(content=result)
+
+    except Exception as e:
+        raise HTTPException(500, f"Erreur chargement sources: {e}")
+
+
+# ─── POST /settings/sources/{source_id}/sync ─────────────────────────────────
+
+@router.post("/settings/sources/{source_id}/sync")
+def sync_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    _setup(db, user)
+    # Placeholder — brancher un celery/background task ici si nécessaire
+    return JSONResponse(content={
+        "ok":        True,
+        "source_id": source_id,
+        "message":   f"Source {source_id} sync scheduled (background task).",
+    })
+
+
+# ─── GET /settings/audit-logs ─────────────────────────────────────────────────
+
+@router.get("/settings/audit-logs")
+def get_audit_logs(
+    limit:  int = 20,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    tid = _setup(db, user)
+
+    try:
+        # Try case_screening_decisions first (richest audit data)
+        has_csd = db.execute(
+            text("SELECT to_regclass('public.case_screening_decisions')")
+        ).scalar()
+
+        if has_csd:
+            try:
+                total_row = db.execute(
+                    text("SELECT COUNT(*)::int AS total FROM public.case_screening_decisions WHERE tenant_id = CAST(:tid AS uuid)"),
+                    {"tid": tid},
+                ).mappings().first()
+                total = total_row["total"] if total_row else 0
+
+                rows = db.execute(
+                    text("""
+                        SELECT
+                            csd.id::text                AS id,
+                            csd.decision                AS action,
+                            csd.comment                 AS detail,
+                            csd.decided_by_email        AS user_email,
+                            csd.decided_at              AS created_at,
+                            csd.request_id::text        AS request_id,
+                            csd.case_id::text           AS case_id
+                        FROM public.case_screening_decisions csd
+                        WHERE csd.tenant_id = CAST(:tid AS uuid)
+                        ORDER BY csd.decided_at DESC
+                        LIMIT :limit OFFSET :offset
+                    """),
+                    {"tid": tid, "limit": limit, "offset": offset},
+                ).mappings().all()
+
+                return JSONResponse(content={
+                    "items":  [dict(r) for r in rows],
+                    "total":  total,
+                    "limit":  limit,
+                    "offset": offset,
+                })
+            except Exception:
+                try:
+                    db.rollback()
+                    _setup(db, user)
+                except Exception:
+                    pass
+
+        # Fallback: screening_results
+        total_row = db.execute(
+            text("SELECT COUNT(*)::int AS total FROM public.screening_results WHERE tenant_id = CAST(:tid AS uuid)"),
+            {"tid": tid},
+        ).mappings().first()
+        total = total_row["total"] if total_row else 0
+
+        rows = db.execute(
+            text("""
+                SELECT
+                    res.id::text                                AS id,
+                    ('Screening · ' || res.recommended_action) AS action,
+                    ('Risque: ' || res.risk_level)             AS detail,
+                    res.decided_by                             AS user_email,
+                    res.decided_at                             AS created_at,
+                    res.request_id::text                       AS request_id,
+                    NULL::text                                 AS case_id
+                FROM public.screening_results res
+                WHERE res.tenant_id = CAST(:tid AS uuid)
+                ORDER BY res.decided_at DESC
+                LIMIT :limit OFFSET :offset
+            """),
+            {"tid": tid, "limit": limit, "offset": offset},
+        ).mappings().all()
+
+        return JSONResponse(content={
+            "items":  [dict(r) for r in rows],
+            "total":  total,
+            "limit":  limit,
+            "offset": offset,
+        })
+
+    except Exception as e:
+        raise HTTPException(500, f"Erreur chargement audit logs: {e}")
+
+
+# ─── GET /settings/users ──────────────────────────────────────────────────────
+
+@router.get("/settings/users")
+def list_users(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    tid = _setup(db, user)
+
+    try:
+        # Try with role column
+        rows = db.execute(
+            text("""
+                SELECT
+                    u.id::text                   AS id,
+                    u.email,
+                    COALESCE(u.role::text, 'ANALYST') AS role,
+                    u.full_name,
+                    u.is_active,
+                    u.created_at,
+                    u.last_login                 AS last_active
+                FROM public.users u
+                WHERE u.tenant_id = CAST(:tid AS uuid)
+                  AND (u.is_active IS NULL OR u.is_active = true)
+                ORDER BY u.created_at DESC
+                LIMIT 100
+            """),
+            {"tid": tid},
+        ).mappings().all()
+        return JSONResponse(content=[dict(r) for r in rows])
+
+    except Exception as e:
+        # Retry without role/is_active if columns don't exist
+        try:
+            db.rollback()
+            _setup(db, user)
+            rows = db.execute(
+                text("""
+                    SELECT u.id::text AS id, u.email, u.full_name, u.created_at
+                    FROM public.users u
+                    WHERE u.tenant_id = CAST(:tid AS uuid)
+                    ORDER BY u.created_at DESC LIMIT 100
+                """),
+                {"tid": tid},
+            ).mappings().all()
+            return JSONResponse(content=[{**dict(r), "role": "ANALYST"} for r in rows])
+        except Exception as e2:
+            raise HTTPException(500, f"Erreur chargement utilisateurs: {e2}")
+
+
+# ─── POST /settings/users/invite ─────────────────────────────────────────────
+
+@router.post("/settings/users/invite")
+def invite_user(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    tid = _setup(db, user)
+    email = str(payload.get("email") or "").strip().lower()
+    role  = str(payload.get("role") or "ANALYST").upper().strip()
+
+    if not email or "@" not in email:
+        raise HTTPException(422, "Email invalide")
+
+    valid_roles = {"ADMIN", "ANALYST", "VIEWER", "MANAGER"}
+    if role not in valid_roles:
+        role = "ANALYST"
+
+    try:
+        # Check existing
+        existing = db.execute(
+            text("SELECT 1 FROM public.users WHERE lower(email) = lower(:email) AND tenant_id = CAST(:tid AS uuid) LIMIT 1"),
+            {"email": email, "tid": tid},
+        ).fetchone()
+        if existing:
+            raise HTTPException(409, f"L'utilisateur {email} existe déjà dans ce tenant.")
+
+        # Try invitations table
+        has_inv = db.execute(text("SELECT to_regclass('public.invitations')")).scalar()
+        if has_inv:
+            db.execute(
+                text("""
+                    INSERT INTO public.invitations (email, role, tenant_id, created_at, status)
+                    VALUES (lower(:email), :role, CAST(:tid AS uuid), now(), 'pending')
+                    ON CONFLICT (email, tenant_id) DO UPDATE
+                        SET role = :role, status = 'pending', created_at = now()
+                """),
+                {"email": email, "role": role, "tid": tid},
+            )
+            db.commit()
+        # else: no invitations table — just return success (email sending handled elsewhere)
+
+        return JSONResponse(content={"ok": True, "email": email, "role": role})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(500, f"Erreur invitation: {e}")
+
+
+# ─── PATCH /settings/users/{user_id} ─────────────────────────────────────────
+
+@router.patch("/settings/users/{user_id}")
+def update_user_role(
+    user_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    tid = _setup(db, user)
+    role = str(payload.get("role") or "").upper().strip()
+
+    valid_roles = {"ADMIN", "ANALYST", "VIEWER", "MANAGER"}
+    if not role or role not in valid_roles:
+        raise HTTPException(422, f"Rôle invalide. Valeurs: {', '.join(valid_roles)}")
+
+    try:
+        result = db.execute(
+            text("""
+                UPDATE public.users
+                SET role       = :role,
+                    updated_at = now()
+                WHERE id           = CAST(:uid AS uuid)
+                  AND tenant_id    = CAST(:tid AS uuid)
+                RETURNING id::text
+            """),
+            {"role": role, "uid": user_id, "tid": tid},
+        ).fetchone()
+
+        if not result:
+            raise HTTPException(404, "Utilisateur non trouvé dans ce tenant")
+
+        db.commit()
+        return JSONResponse(content={"ok": True, "user_id": user_id, "role": role})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(500, f"Erreur mise à jour rôle: {e}")

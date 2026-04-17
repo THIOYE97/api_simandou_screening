@@ -13,7 +13,7 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.cascade import router as cascade_router
 from app.api.routes.analyst import router as analyst_router
 from app.api.routes.admin_tenants import router as admin_tenants_router
-
+from app.api.routes.settings_routes import router as settings_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -57,3 +57,4 @@ app.include_router(documents_router)
 app.include_router(cascade_router)
 app.include_router(analyst_router)
 app.include_router(admin_tenants_router)
+app.include_router(settings_router)
