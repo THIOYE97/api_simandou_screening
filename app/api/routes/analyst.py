@@ -4,8 +4,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
+from io import StringIO
+import csv
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
@@ -521,160 +525,484 @@ def list_screenings(
     provider: str | None = None,
     name: str | None = None,
     kind: str | None = None,
+    risk_level: str | None = None,
     db: Session = Depends(get_db),
-    
 ):
     """
     Retour paginé compatible front:
       { items: [...], limit, offset, total }
-    Inclut désormais risk_level + matches_count depuis screening_results / screening_matches.
+
+    Filtres supportés:
+      - status
+      - provider
+      - name
+      - kind
+      - risk_level
+
+    Inclut:
+      - risk_level
+      - confidence
+      - recommended_action
+      - matches_count
+      - client_name
     """
-    base = db.query(ScreeningRequest)
 
-    can_filter_status   = hasattr(ScreeningRequest, "status")
-    can_filter_provider = hasattr(ScreeningRequest, "provider")
+    status_norm = (status or "").strip().upper()
+    provider_norm = (provider or "").strip()
+    name_norm = (name or "").strip()
+    kind_norm = (kind or "").strip()
+    risk_norm = (risk_level or "").strip().upper()
 
-    if status and can_filter_status:
-        base = base.filter(ScreeningRequest.status == status)
-    if provider and can_filter_provider:
-        base = base.filter(ScreeningRequest.provider == provider)
+    if status_norm in ("", "ALL"):
+        status_norm = ""
 
-    total_base = int(base.with_entities(func.count()).scalar() or 0)
+    if risk_norm in ("", "ALL", "ALL_MATCHES"):
+        risk_norm = ""
 
-    rows: list[ScreeningRequest] = (
-        base.order_by(desc(getattr(ScreeningRequest, "created_at")))
-        .limit(limit)
-        .offset(offset)
-        .all()
-    )
+    status_map = {
+        "TERMINE": "DONE",
+        "TERMINÉ": "DONE",
+        "DONE": "DONE",
+        "PENDING": "PENDING",
+        "RUNNING": "RUNNING",
+        "FAILED": "FAILED",
+        "ERROR": "ERROR",
+    }
 
-    def _keep(r: ScreeningRequest) -> bool:
-        if status   and _get_status(r)   != status:   return False
-        if provider and _get_provider(r) != provider: return False
-        if kind     and _get_kind(r)     != kind:     return False
-        if name:
-            payload = _get_payload(r)
-            nm = (_safe_str(payload.get("override_name")) or _safe_str(payload.get("name")) or "")
-            fn = _safe_str(payload.get("first_name") or payload.get("firstName")) or ""
-            ln = _safe_str(payload.get("last_name")  or payload.get("lastName"))  or ""
-            full = f"{fn} {ln}".strip()
-            cand = (nm or full).lower()
-            if name.lower().strip() not in cand:
-                return False
-        return True
+    risk_map = {
+        "HIGH": "HIGH",
+        "HIGH_RISK": "HIGH",
+        "MEDIUM": "MEDIUM",
+        "MEDIUM_RISK": "MEDIUM",
+        "LOW": "LOW",
+        "LOW_RISK": "LOW",
+    }
 
-    rows = [r for r in rows if _keep(r)]
+    if status_norm:
+        status_norm = status_map.get(status_norm, status_norm)
 
-    # total réel si filtres python
-    total = total_base
-    python_filters_active = bool(
-        kind or name
-        or (status   and not can_filter_status)
-        or (provider and not can_filter_provider)
-    )
-    if python_filters_active:
-        cap = 4000
-        scan_rows: list[ScreeningRequest] = (
-            base.order_by(desc(getattr(ScreeningRequest, "created_at")))
-            .limit(cap).all()
+    if risk_norm:
+        risk_norm = risk_map.get(risk_norm, risk_norm)
+
+    params: dict[str, Any] = {
+        "limit": limit,
+        "offset": offset,
+    }
+
+    sql = """
+        WITH match_counts AS (
+            SELECT
+                request_id,
+                COUNT(*)::int AS matches_count
+            FROM public.screening_matches
+            GROUP BY request_id
+        ),
+        base AS (
+            SELECT
+                sr.id::text AS id,
+                sr.provider::text AS provider,
+                sr.status::text AS status,
+                sr.created_at AS created_at,
+                sr.completed_at AS completed_at,
+                sr.case_id::text AS case_id,
+                sr.client_id::text AS client_id,
+                sr.request_payload AS request_payload,
+
+                res.risk_level::text AS risk_level,
+                res.confidence AS confidence,
+                res.recommended_action::text AS recommended_action,
+
+                COALESCE(mc.matches_count, 0)::int AS matches_count,
+
+                CASE
+                    WHEN c.id IS NULL THEN NULL
+                    ELSE to_jsonb(c)
+                END AS case_payload
+
+            FROM public.screening_requests sr
+            LEFT JOIN public.screening_results res
+                ON res.request_id = sr.id
+            LEFT JOIN match_counts mc
+                ON mc.request_id = sr.id
+            LEFT JOIN public.cases c
+                ON c.id = sr.case_id
+            WHERE 1 = 1
+    """
+
+    if status_norm:
+        sql += " AND UPPER(COALESCE(sr.status::text, '')) = :status"
+        params["status"] = status_norm
+
+    if provider_norm:
+        sql += " AND UPPER(COALESCE(sr.provider::text, '')) = UPPER(:provider)"
+        params["provider"] = provider_norm
+
+    if risk_norm:
+        sql += " AND UPPER(COALESCE(res.risk_level::text, '')) = :risk_level"
+        params["risk_level"] = risk_norm
+
+    if kind_norm:
+        sql += """
+            AND (
+                sr.request_payload->>'kind' = :kind
+                OR sr.request_payload->>'trigger' = :kind
+            )
+        """
+        params["kind"] = kind_norm
+
+    if name_norm:
+        sql += """
+            AND (
+                sr.id::text ILIKE :name
+                OR sr.request_payload->>'override_name' ILIKE :name
+                OR sr.request_payload->>'name' ILIKE :name
+                OR sr.request_payload->>'first_name' ILIKE :name
+                OR sr.request_payload->>'last_name' ILIKE :name
+                OR sr.request_payload->>'firstName' ILIKE :name
+                OR sr.request_payload->>'lastName' ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'display_name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'client_name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'full_name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'first_name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'last_name', '') ILIKE :name
+            )
+        """
+        params["name"] = f"%{name_norm}%"
+
+    sql += """
         )
-        total = len([r for r in scan_rows if _keep(r)])
-        if total_base > cap:
-            total = max(total, min(total_base, cap))
+        SELECT
+            *,
+            COUNT(*) OVER()::int AS total_count
+        FROM base
+        ORDER BY created_at DESC NULLS LAST
+        LIMIT :limit
+        OFFSET :offset
+    """
 
-    # ── Bulk: cases ──────────────────────────────────────────────────
-    case_ids: list[str] = []
-    for r in rows:
-        cid = _get_req_case_id(r)
-        if cid:
-            case_ids.append(cid)
-
-    cases_by_id: dict[str, Case] = {}
-    if case_ids:
-        cases = db.query(Case).filter(Case.id.in_(case_ids)).all()
-        cases_by_id = {str(c.id): c for c in cases}
-
-    # ── Bulk: screening_results (risk_level + confidence + recommended_action) ──
-    request_ids = [getattr(r, "id") for r in rows]
-    results_by_request_id: dict[str, dict] = {}
-    if request_ids:
+    try:
+        rows = db.execute(text(sql), params).mappings().all()
+    except Exception as e:
         try:
-            res_rows = db.execute(
-                text("""
-                    SELECT
-                        request_id::text AS request_id,
-                        risk_level,
-                        confidence,
-                        recommended_action
-                    FROM public.screening_results
-                    WHERE request_id = ANY(CAST(:ids AS uuid[]))
-                """),
-                {"ids": [str(rid) for rid in request_ids]},
-            ).mappings().all()
-            for rr in res_rows:
-                results_by_request_id[rr["request_id"]] = dict(rr)
+            db.rollback()
         except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
+            pass
+        raise HTTPException(500, f"Failed to list screenings: {e}")
 
-    # ── Bulk: matches count per request ──────────────────────────────
-    matches_count_by_id: dict[str, int] = {}
-    if request_ids:
-        try:
-            mc_rows = db.execute(
-                text("""
-                    SELECT
-                        request_id::text AS request_id,
-                        COUNT(*) AS cnt
-                    FROM public.screening_matches
-                    WHERE request_id = ANY(CAST(:ids AS uuid[]))
-                    GROUP BY request_id
-                """),
-                {"ids": [str(rid) for rid in request_ids]},
-            ).mappings().all()
-            for mc in mc_rows:
-                matches_count_by_id[mc["request_id"]] = int(mc["cnt"])
-        except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-
-    # ── Build items ───────────────────────────────────────────────────
     items = []
-    for r in rows:
-        payload  = _get_payload(r)
-        cid      = _get_req_case_id(r)
-        c        = cases_by_id.get(cid) if cid else None
-        rid_str  = str(getattr(r, "id"))
-        result   = results_by_request_id.get(rid_str, {})
+
+    for row in rows:
+        payload = row.get("request_payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        case_payload = row.get("case_payload") or {}
+        if not isinstance(case_payload, dict):
+            case_payload = {}
+
+        first_name = (
+            _safe_str(payload.get("first_name"))
+            or _safe_str(payload.get("firstName"))
+            or _safe_str(case_payload.get("first_name"))
+            or _safe_str(case_payload.get("firstName"))
+            or ""
+        )
+
+        last_name = (
+            _safe_str(payload.get("last_name"))
+            or _safe_str(payload.get("lastName"))
+            or _safe_str(case_payload.get("last_name"))
+            or _safe_str(case_payload.get("lastName"))
+            or ""
+        )
+
+        full_from_parts = f"{first_name} {last_name}".strip()
 
         client_name = (
-            _case_display_name(c)
+            _case_display_name(case_payload)
             or _safe_str(payload.get("override_name"))
             or _safe_str(payload.get("name"))
             or _client_name_from_payload(payload)
+            or full_from_parts
+            or None
+        )
+
+        item_kind = (
+            _safe_str(payload.get("kind"))
+            or _safe_str(payload.get("trigger"))
+            or None
         )
 
         items.append({
-            "id":                rid_str,
-            "provider":          _get_provider(r),
-            "status":            _get_status(r),
-            "created_at":        getattr(r, "created_at", None),
-            "completed_at":      getattr(r, "completed_at", None),
-            "case_id":           cid,
-            "kind":              _get_kind(r),
-            "client_name":       client_name,
-            # ✅ nouveaux champs
-            "risk_level":        result.get("risk_level"),
-            "confidence":        result.get("confidence"),
-            "recommended_action":result.get("recommended_action"),
-            "matches_count":     matches_count_by_id.get(rid_str, 0),
+            "id": row.get("id"),
+            "provider": row.get("provider") or "INTERNAL",
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+            "completed_at": row.get("completed_at"),
+            "case_id": row.get("case_id"),
+            "client_id": row.get("client_id"),
+            "kind": item_kind,
+            "client_name": client_name,
+            "first_name": first_name or None,
+            "last_name": last_name or None,
+            "risk_level": row.get("risk_level"),
+            "confidence": row.get("confidence"),
+            "recommended_action": row.get("recommended_action"),
+            "matches_count": row.get("matches_count") or 0,
         })
 
-    return {"items": items, "limit": limit, "offset": offset, "total": total}
+    total = int(rows[0].get("total_count") or 0) if rows else 0
+
+    return {
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+    }
+
+@router.get("/screenings/export.csv")
+def export_screenings_csv(
+    status: str | None = Query(None),
+    risk_level: str | None = Query(None),
+    name: str | None = Query(None),
+    provider: str | None = Query(None),
+    kind: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Export CSV des screenings selon les filtres actifs dans la liste analyste.
+
+    Exemples:
+      /analyst/screenings/export.csv
+      /analyst/screenings/export.csv?risk_level=HIGH
+      /analyst/screenings/export.csv?risk_level=LOW&status=DONE
+      /analyst/screenings/export.csv?status=RUNNING
+    """
+
+    status_norm = (status or "").strip().upper()
+    risk_norm = (risk_level or "").strip().upper()
+    provider_norm = (provider or "").strip()
+    kind_norm = (kind or "").strip()
+    name_norm = (name or "").strip()
+
+    if status_norm in ("", "ALL"):
+        status_norm = ""
+
+    if risk_norm in ("", "ALL", "ALL_MATCHES"):
+        risk_norm = ""
+
+    status_map = {
+        "TERMINE": "DONE",
+        "TERMINÉ": "DONE",
+        "DONE": "DONE",
+        "PENDING": "PENDING",
+        "RUNNING": "RUNNING",
+        "FAILED": "FAILED",
+        "ERROR": "ERROR",
+    }
+
+    risk_map = {
+        "HIGH": "HIGH",
+        "HIGH_RISK": "HIGH",
+        "MEDIUM": "MEDIUM",
+        "MEDIUM_RISK": "MEDIUM",
+        "LOW": "LOW",
+        "LOW_RISK": "LOW",
+    }
+
+    if status_norm:
+        status_norm = status_map.get(status_norm, status_norm)
+
+    if risk_norm:
+        risk_norm = risk_map.get(risk_norm, risk_norm)
+
+    params: dict[str, Any] = {}
+
+    sql = """
+        WITH match_counts AS (
+            SELECT
+                request_id,
+                COUNT(*)::int AS matches_count
+            FROM public.screening_matches
+            GROUP BY request_id
+        )
+        SELECT
+            sr.id::text AS id,
+            sr.provider::text AS provider,
+            sr.status::text AS status,
+            sr.created_at AS created_at,
+            sr.completed_at AS completed_at,
+            sr.case_id::text AS case_id,
+            sr.client_id::text AS client_id,
+            sr.request_payload AS request_payload,
+
+            res.risk_level::text AS risk_level,
+            res.confidence AS confidence,
+            res.recommended_action::text AS recommended_action,
+
+            COALESCE(mc.matches_count, 0)::int AS matches_count,
+
+            CASE
+                WHEN c.id IS NULL THEN NULL
+                ELSE to_jsonb(c)
+            END AS case_payload
+
+        FROM public.screening_requests sr
+        LEFT JOIN public.screening_results res
+            ON res.request_id = sr.id
+        LEFT JOIN match_counts mc
+            ON mc.request_id = sr.id
+        LEFT JOIN public.cases c
+            ON c.id = sr.case_id
+        WHERE 1 = 1
+    """
+
+    if status_norm:
+        sql += " AND UPPER(COALESCE(sr.status::text, '')) = :status"
+        params["status"] = status_norm
+
+    if provider_norm:
+        sql += " AND UPPER(COALESCE(sr.provider::text, '')) = UPPER(:provider)"
+        params["provider"] = provider_norm
+
+    if risk_norm:
+        sql += " AND UPPER(COALESCE(res.risk_level::text, '')) = :risk_level"
+        params["risk_level"] = risk_norm
+
+    if kind_norm:
+        sql += """
+            AND (
+                sr.request_payload->>'kind' = :kind
+                OR sr.request_payload->>'trigger' = :kind
+            )
+        """
+        params["kind"] = kind_norm
+
+    if name_norm:
+        sql += """
+            AND (
+                sr.id::text ILIKE :name
+                OR sr.request_payload->>'override_name' ILIKE :name
+                OR sr.request_payload->>'name' ILIKE :name
+                OR sr.request_payload->>'first_name' ILIKE :name
+                OR sr.request_payload->>'last_name' ILIKE :name
+                OR sr.request_payload->>'firstName' ILIKE :name
+                OR sr.request_payload->>'lastName' ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'display_name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'client_name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'full_name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'first_name', '') ILIKE :name
+                OR COALESCE(to_jsonb(c)->>'last_name', '') ILIKE :name
+            )
+        """
+        params["name"] = f"%{name_norm}%"
+
+    sql += """
+        ORDER BY sr.created_at DESC NULLS LAST
+        LIMIT 10000
+    """
+
+    try:
+        rows = db.execute(text(sql), params).mappings().all()
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(500, f"Failed to export screenings: {e}")
+
+    output = StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow([
+        "Screening ID",
+        "Name",
+        "Risk Level",
+        "Status",
+        "Provider",
+        "Kind",
+        "Confidence",
+        "Recommended Action",
+        "Matches Count",
+        "Case ID",
+        "Client ID",
+        "Created At",
+        "Completed At",
+    ])
+
+    for row in rows:
+        payload = row.get("request_payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        case_payload = row.get("case_payload") or {}
+        if not isinstance(case_payload, dict):
+            case_payload = {}
+
+        first_name = (
+            _safe_str(payload.get("first_name"))
+            or _safe_str(payload.get("firstName"))
+            or _safe_str(case_payload.get("first_name"))
+            or _safe_str(case_payload.get("firstName"))
+            or ""
+        )
+
+        last_name = (
+            _safe_str(payload.get("last_name"))
+            or _safe_str(payload.get("lastName"))
+            or _safe_str(case_payload.get("last_name"))
+            or _safe_str(case_payload.get("lastName"))
+            or ""
+        )
+
+        full_from_parts = f"{first_name} {last_name}".strip()
+
+        client_name = (
+            _case_display_name(case_payload)
+            or _safe_str(payload.get("override_name"))
+            or _safe_str(payload.get("name"))
+            or _client_name_from_payload(payload)
+            or full_from_parts
+            or ""
+        )
+
+        item_kind = (
+            _safe_str(payload.get("kind"))
+            or _safe_str(payload.get("trigger"))
+            or ""
+        )
+
+        writer.writerow([
+            row.get("id") or "",
+            client_name,
+            row.get("risk_level") or "",
+            row.get("status") or "",
+            row.get("provider") or "",
+            item_kind,
+            row.get("confidence") or "",
+            row.get("recommended_action") or "",
+            row.get("matches_count") or 0,
+            row.get("case_id") or "",
+            row.get("client_id") or "",
+            row.get("created_at") or "",
+            row.get("completed_at") or "",
+        ])
+
+    output.seek(0)
+
+    risk_part = risk_norm.lower() if risk_norm else "all"
+    status_part = status_norm.lower() if status_norm else "all"
+    filename = f"screenings_{risk_part}_{status_part}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+
+    return StreamingResponse(
+        output,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
 
 @router.get("/screenings/{request_id}", response_model=ScreeningDetailsOut)
 def screening_details(

@@ -41,7 +41,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://app.simandou-screening.com",
-        "https://backoffice.simandou-screening.com"
+        "https://backoffice.simandou-screening.com",
+        "http://localhost:5173"
     ],
     allow_credentials=True,
     allow_methods=["*"],
