@@ -542,6 +542,8 @@ def list_screenings(
     risk_level: str | None = None,
     date: str | None = Query(None, description="Filtre date au format YYYY-MM-DD"),
     hour: int | None = Query(None, ge=0, le=23, description="Filtre heure (0-23)"),
+    date_from: str | None = Query(None, description="Borne inférieure inclusive YYYY-MM-DD"),
+    date_to: str | None = Query(None, description="Borne supérieure inclusive YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ):
     """
@@ -554,8 +556,10 @@ def list_screenings(
       - name
       - kind
       - risk_level
-      - date (YYYY-MM-DD) : filtre sur created_at
+      - date (YYYY-MM-DD) : filtre sur created_at (jour exact)
       - hour (0-23) : filtre sur l'heure de created_at
+      - date_from (YYYY-MM-DD) : borne inférieure inclusive sur created_at
+      - date_to   (YYYY-MM-DD) : borne supérieure inclusive sur created_at
 
     Inclut:
       - risk_level
@@ -571,7 +575,12 @@ def list_screenings(
     kind_norm = (kind or "").strip()
     risk_norm = (risk_level or "").strip().upper()
     date_norm = _normalize_date_filter(date)
+    date_from_norm = _normalize_date_filter(date_from)
+    date_to_norm = _normalize_date_filter(date_to)
     hour_norm = hour if hour is not None else None
+
+    if date_from_norm and date_to_norm and date_from_norm > date_to_norm:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
 
     if status_norm in ("", "ALL"):
         status_norm = ""
@@ -694,6 +703,14 @@ def list_screenings(
         sql += " AND sr.created_at::date = CAST(:date AS date)"
         params["date"] = date_norm
 
+    if date_from_norm:
+        sql += " AND sr.created_at::date >= CAST(:date_from AS date)"
+        params["date_from"] = date_from_norm
+
+    if date_to_norm:
+        sql += " AND sr.created_at::date <= CAST(:date_to AS date)"
+        params["date_to"] = date_to_norm
+
     if hour_norm is not None:
         sql += " AND EXTRACT(HOUR FROM sr.created_at)::int = :hour"
         params["hour"] = hour_norm
@@ -798,6 +815,8 @@ def export_screenings_csv(
     kind: str | None = Query(None),
     date: str | None = Query(None, description="Filtre date au format YYYY-MM-DD"),
     hour: int | None = Query(None, ge=0, le=23, description="Filtre heure (0-23)"),
+    date_from: str | None = Query(None, description="Borne inférieure inclusive YYYY-MM-DD"),
+    date_to: str | None = Query(None, description="Borne supérieure inclusive YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ):
     """
@@ -810,6 +829,7 @@ def export_screenings_csv(
       /analyst/screenings/export.csv?status=RUNNING
       /analyst/screenings/export.csv?date=2026-05-07
       /analyst/screenings/export.csv?date=2026-05-07&hour=14
+      /analyst/screenings/export.csv?date_from=2026-04-01&date_to=2026-05-07
     """
 
     status_norm = (status or "").strip().upper()
@@ -818,7 +838,12 @@ def export_screenings_csv(
     kind_norm = (kind or "").strip()
     name_norm = (name or "").strip()
     date_norm = _normalize_date_filter(date)
+    date_from_norm = _normalize_date_filter(date_from)
+    date_to_norm = _normalize_date_filter(date_to)
     hour_norm = hour if hour is not None else None
+
+    if date_from_norm and date_to_norm and date_from_norm > date_to_norm:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
 
     if status_norm in ("", "ALL"):
         status_norm = ""
@@ -937,6 +962,14 @@ def export_screenings_csv(
         sql += " AND sr.created_at::date = CAST(:date AS date)"
         params["date"] = date_norm
 
+    if date_from_norm:
+        sql += " AND sr.created_at::date >= CAST(:date_from AS date)"
+        params["date_from"] = date_from_norm
+
+    if date_to_norm:
+        sql += " AND sr.created_at::date <= CAST(:date_to AS date)"
+        params["date_to"] = date_to_norm
+
     if hour_norm is not None:
         sql += " AND EXTRACT(HOUR FROM sr.created_at)::int = :hour"
         params["hour"] = hour_norm
@@ -1036,7 +1069,10 @@ def export_screenings_csv(
 
     risk_part = risk_norm.lower() if risk_norm else "all"
     status_part = status_norm.lower() if status_norm else "all"
-    filename = f"screenings_{risk_part}_{status_part}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    range_part = ""
+    if date_from_norm or date_to_norm:
+        range_part = f"_{date_from_norm or 'any'}_to_{date_to_norm or 'any'}"
+    filename = f"screenings_{risk_part}_{status_part}{range_part}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
 
     return StreamingResponse(
         output,
