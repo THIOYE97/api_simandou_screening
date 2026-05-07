@@ -414,6 +414,20 @@ def _require_comment(s: str) -> str:
     return t
 
 
+def _normalize_date_filter(value: str | None) -> str | None:
+    """Valide une date au format YYYY-MM-DD. Retourne None si vide."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="date must be in YYYY-MM-DD format")
+    return s
+
+
 
 def _ensure_decisions_table(db: Session) -> None:
     has_tbl = db.execute(text("SELECT to_regclass('public.case_screening_decisions')")).scalar()
@@ -526,6 +540,8 @@ def list_screenings(
     name: str | None = None,
     kind: str | None = None,
     risk_level: str | None = None,
+    date: str | None = Query(None, description="Filtre date au format YYYY-MM-DD"),
+    hour: int | None = Query(None, ge=0, le=23, description="Filtre heure (0-23)"),
     db: Session = Depends(get_db),
 ):
     """
@@ -538,6 +554,8 @@ def list_screenings(
       - name
       - kind
       - risk_level
+      - date (YYYY-MM-DD) : filtre sur created_at
+      - hour (0-23) : filtre sur l'heure de created_at
 
     Inclut:
       - risk_level
@@ -552,6 +570,8 @@ def list_screenings(
     name_norm = (name or "").strip()
     kind_norm = (kind or "").strip()
     risk_norm = (risk_level or "").strip().upper()
+    date_norm = _normalize_date_filter(date)
+    hour_norm = hour if hour is not None else None
 
     if status_norm in ("", "ALL"):
         status_norm = ""
@@ -670,6 +690,14 @@ def list_screenings(
         """
         params["name"] = f"%{name_norm}%"
 
+    if date_norm:
+        sql += " AND sr.created_at::date = CAST(:date AS date)"
+        params["date"] = date_norm
+
+    if hour_norm is not None:
+        sql += " AND EXTRACT(HOUR FROM sr.created_at)::int = :hour"
+        params["hour"] = hour_norm
+
     sql += """
         )
         SELECT
@@ -768,6 +796,8 @@ def export_screenings_csv(
     name: str | None = Query(None),
     provider: str | None = Query(None),
     kind: str | None = Query(None),
+    date: str | None = Query(None, description="Filtre date au format YYYY-MM-DD"),
+    hour: int | None = Query(None, ge=0, le=23, description="Filtre heure (0-23)"),
     db: Session = Depends(get_db),
 ):
     """
@@ -778,6 +808,8 @@ def export_screenings_csv(
       /analyst/screenings/export.csv?risk_level=HIGH
       /analyst/screenings/export.csv?risk_level=LOW&status=DONE
       /analyst/screenings/export.csv?status=RUNNING
+      /analyst/screenings/export.csv?date=2026-05-07
+      /analyst/screenings/export.csv?date=2026-05-07&hour=14
     """
 
     status_norm = (status or "").strip().upper()
@@ -785,6 +817,8 @@ def export_screenings_csv(
     provider_norm = (provider or "").strip()
     kind_norm = (kind or "").strip()
     name_norm = (name or "").strip()
+    date_norm = _normalize_date_filter(date)
+    hour_norm = hour if hour is not None else None
 
     if status_norm in ("", "ALL"):
         status_norm = ""
@@ -898,6 +932,14 @@ def export_screenings_csv(
             )
         """
         params["name"] = f"%{name_norm}%"
+
+    if date_norm:
+        sql += " AND sr.created_at::date = CAST(:date AS date)"
+        params["date"] = date_norm
+
+    if hour_norm is not None:
+        sql += " AND EXTRACT(HOUR FROM sr.created_at)::int = :hour"
+        params["hour"] = hour_norm
 
     sql += """
         ORDER BY sr.created_at DESC NULLS LAST
