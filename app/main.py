@@ -1,54 +1,94 @@
 # app/main.py
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-import os
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from starlette.responses import JSONResponse
 
-from app.api.routes.screening import router as screening_router
-from app.api.routes.health import router as health_router
-from app.api.routes import admin
-from app.api.routes.cases import router as cases_router
-from app.api.routes.documents import router as documents_router
-from app.api.routes.auth import router as auth_router
-from app.api.routes.cascade import router as cascade_router
-from app.api.routes.analyst import router as analyst_router
-from app.api.routes.admin_tenants import router as admin_tenants_router
-from app.api.routes.settings_routes import router as settings_router
+from app.core.config import settings
+from app.core.limiter import limiter
+from app.core.logging import get_logger, setup_logging
+from app.core.observability import RequestContextMiddleware, init_sentry
+
+# --- Logging setup (avant import des routes pour capturer leurs logs) ---
+setup_logging(level=settings.LOG_LEVEL, json_output=settings.LOG_JSON)
+logger = get_logger("simandou.main")
+
+# --- Sentry (no-op si SENTRY_DSN absent) ---
+init_sentry()
+
+# --- Routers (import après setup_logging) ---
+from app.api.routes import admin  # noqa: E402
+from app.api.routes.admin_tenants import router as admin_tenants_router  # noqa: E402
+from app.api.routes.analyst import router as analyst_router  # noqa: E402
+from app.api.routes.auth import router as auth_router  # noqa: E402
+from app.api.routes.cascade import router as cascade_router  # noqa: E402
+from app.api.routes.cases import router as cases_router  # noqa: E402
+from app.api.routes.documents import router as documents_router  # noqa: E402
+from app.api.routes.health import router as health_router  # noqa: E402
+from app.api.routes.screening import router as screening_router  # noqa: E402
+from app.api.routes.settings_routes import router as settings_router  # noqa: E402
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Claude Vision API — pas de preload RAM nécessaire, juste vérifier la clé
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        print("[startup] ✅ ANTHROPIC_API_KEY présente — Claude Vision OCR prêt")
-    else:
-        print("[startup] ⚠️  ANTHROPIC_API_KEY manquante — OCR échouera")
+    logger.info(
+        "startup",
+        extra={
+            "env": settings.ENVIRONMENT,
+            "log_level": settings.LOG_LEVEL,
+            "rate_limit_enabled": settings.RATE_LIMIT_ENABLED,
+            "storage_backend": settings.STORAGE_BACKEND,
+            "anthropic_ready": bool(settings.ANTHROPIC_API_KEY),
+        },
+    )
     yield
+    logger.info("shutdown")
 
-
-IS_DEV = os.getenv("ENVIRONMENT", "production") == "development"
 
 app = FastAPI(
     title="simandou-screening-api",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs" if IS_DEV else None,
-    redoc_url="/redoc" if IS_DEV else None,
-    openapi_url="/openapi.json" if IS_DEV else None,
+    docs_url="/docs" if settings.is_dev else None,
+    redoc_url="/redoc" if settings.is_dev else None,
+    openapi_url="/openapi.json" if settings.is_dev else None,
 )
 
+# --- Rate limiter ---
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request, exc: RateLimitExceeded):
+    logger.warning(
+        "rate_limit_exceeded",
+        extra={"path": request.url.path, "detail": str(exc.detail)},
+    )
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many requests. Please slow down."},
+        headers={"Retry-After": "60"},
+    )
+
+
+# --- Request ID / access log middleware (avant CORS pour couvrir preflights) ---
+app.add_middleware(RequestContextMiddleware)
+
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://app.simandou-screening.com",
-        "https://backoffice.simandou-screening.com",
-        "http://localhost:5173"
-    ],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["x-request-id"],
 )
 
+# --- Routers ---
 app.include_router(health_router)
 app.include_router(screening_router)
 app.include_router(admin.router)

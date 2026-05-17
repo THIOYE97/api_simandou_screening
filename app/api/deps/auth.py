@@ -10,9 +10,12 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.deps.db import get_db_rls, get_db_public
+from app.core.config import settings
 from app.core.db import set_super_admin_context, set_tenant_context
+from app.core.logging import get_logger, tenant_id_ctx, user_id_ctx
 from app.services.auth_service import decode_access_token
 
+logger = get_logger("simandou.auth")
 bearer = HTTPBearer(auto_error=False)
 
 
@@ -39,8 +42,8 @@ def get_current_user(
     # 1) decode token
     try:
         payload = decode_access_token(creds.credentials)
-    except Exception as e:
-        print("[AUTH] decode_access_token failed:", repr(e))
+    except Exception:
+        logger.info("auth_token_invalid")
         raise HTTPException(status_code=401, detail="Invalid token")
 
     user_id = payload.get("sub")
@@ -50,11 +53,11 @@ def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload (sub missing)")
 
-    # 2) ✅ FIX: bypass RLS pour lire public.users (identique au login)
+    # 2) bypass RLS pour lire public.users (identique au login)
     try:
-        db_public.execute(text("SET ROLE auth_bypass_rls"))
-    except Exception as e:
-        print("[AUTH] SET ROLE auth_bypass_rls failed:", repr(e))
+        db_public.execute(text(f"SET ROLE {settings.AUTH_BYPASS_ROLE}"))
+    except Exception:
+        logger.exception("auth_set_role_failed")
         raise HTTPException(status_code=500, detail="Auth DB role misconfigured")
 
     user = db_public.execute(
@@ -96,6 +99,10 @@ def get_current_user(
     # 4) appliquer contexte RLS SUR db (la session "RLS")
     set_super_admin_context(db, is_super_admin)
     set_tenant_context(db, effective_tenant_id)
+
+    # 5) propager dans les logs structurés
+    user_id_ctx.set(str(user["id"]))
+    tenant_id_ctx.set(str(effective_tenant_id))
 
     out = dict(user)
     out["is_super_admin"] = is_super_admin
