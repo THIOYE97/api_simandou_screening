@@ -9,7 +9,12 @@ from typing import Any, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.cache import cache, make_key
+from app.core.config import settings
+from app.core.logging import get_logger
 from app.models.screening_db import ScreeningMatch, SourceRecord
+
+logger = get_logger("simandou.matching")
 
 
 # -----------------------------------------------------------------------------
@@ -105,6 +110,36 @@ def pick_best_source_record_id(db: Session, entity_id: str) -> tuple[Optional[st
 # Candidate retrieval (pg_trgm)
 # -----------------------------------------------------------------------------
 
+def _candidate_to_dict(c: Candidate) -> dict[str, Any]:
+    return {
+        "entity_id": c.entity_id,
+        "entity_risk": c.entity_risk,
+        "primary_name": c.primary_name,
+        "best_name_id": c.best_name_id,
+        "best_norm": c.best_norm,
+        "trigram_sim": c.trigram_sim,
+        "token_overlap": c.token_overlap,
+        "score": c.score,
+        "source_record_id": c.source_record_id,
+        "source_id": c.source_id,
+    }
+
+
+def _candidate_from_dict(d: dict[str, Any]) -> Candidate:
+    return Candidate(
+        entity_id=d["entity_id"],
+        entity_risk=d["entity_risk"],
+        primary_name=d["primary_name"],
+        best_name_id=int(d["best_name_id"]),
+        best_norm=d["best_norm"],
+        trigram_sim=float(d["trigram_sim"]),
+        token_overlap=float(d["token_overlap"]),
+        score=int(d["score"]),
+        source_record_id=d.get("source_record_id"),
+        source_id=d.get("source_id"),
+    )
+
+
 def retrieve_candidates(
     db: Session,
     input_norm: str,
@@ -117,7 +152,25 @@ def retrieve_candidates(
     then aggregates best match per entity_id.
 
     ✅ Optionally attaches best source_record_id per entity for later match explainability.
+
+    Caching (S2):
+      Si Redis est branché, on cache (input_norm, tokens, limit, attach_best_source_record)
+      → liste de Candidate. TTL = MATCHING_CACHE_TTL_SECONDS (5min par défaut).
+      Invalidation manuelle via invalidate_matching_cache() après import OFAC/EU/UN.
     """
+    cache_key = None
+    if settings.cache_enabled:
+        cache_key = make_key(
+            "matching:cand",
+            input_norm,
+            ",".join(sorted(input_tokens or [])),
+            limit,
+            int(attach_best_source_record),
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.debug("matching_cache_hit", extra={"key": cache_key, "n": len(cached)})
+            return [_candidate_from_dict(d) for d in cached]
 
     sql = text(
         """
@@ -169,7 +222,21 @@ def retrieve_candidates(
             c.source_record_id = sr_id
             c.source_id = src_id
 
+    if cache_key is not None:
+        cache.set(
+            cache_key,
+            [_candidate_to_dict(c) for c in out],
+            ttl=settings.MATCHING_CACHE_TTL_SECONDS,
+        )
+
     return out
+
+
+def invalidate_matching_cache() -> int:
+    """À appeler après un import OFAC/EU/UN/PEP pour invalider les résultats cachés."""
+    n = cache.delete_pattern("matching:cand:*")
+    logger.info("matching_cache_invalidated", extra={"keys_deleted": n})
+    return n
 
 
 # -----------------------------------------------------------------------------
@@ -232,23 +299,3 @@ def explain_match(m: ScreeningMatch) -> dict[str, Any]:
         "band": getattr(m, "match_band", None),
         "source_record_id": getattr(m, "source_record_id", None),
     }
-
-def pick_best_source_record_id(db: Session, entity_id: str) -> tuple[str | None, int | None]:
-    """
-    Returns (source_record_id, source_id) for an entity.
-    Best-effort: picks most recent source_record.
-    """
-    row = db.execute(
-        text("""
-            SELECT id::text AS id, source_id::int AS source_id
-            FROM source_records
-            WHERE entity_id = :eid
-            ORDER BY created_at DESC
-            LIMIT 1
-        """),
-        {"eid": entity_id},
-    ).mappings().first()
-
-    if not row:
-        return (None, None)
-    return (row["id"], int(row["source_id"]) if row.get("source_id") is not None else None)

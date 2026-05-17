@@ -1,10 +1,10 @@
 # app/api/routes/screening.py
 from __future__ import annotations
 
-import traceback as tb
 from uuid import UUID
 from typing import Any, Optional
 
+from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, HTTPException, Header, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -13,17 +13,21 @@ from sqlalchemy.orm import Session
 
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db_rls as get_db
-
-from app.schemas.screening import ScreeningCheckIn, ScreeningCheckOut
-from app.services.simple_screening_engine import run_simple_screening
-
+from app.core.celery_app import celery_app
+from app.core.config import settings
+from app.core.db import set_tenant_context
+from app.core.logging import get_logger
 from app.models.document import Document, OCRStatus
 from app.models.screening_db import ScreeningRequest, ScreeningResult, ScreeningMatch
-from app.services.export_pdf_service import build_screening_pdf
+from app.schemas.screening import ScreeningCheckIn, ScreeningCheckOut
 from app.services.documents_service import apply_ocr_prefill_to_case
-from app.core.db import set_tenant_context
+from app.services.export_pdf_service import build_screening_pdf
+from app.services.simple_screening_engine import run_simple_screening
+from app.services.storage import get_storage
+from app.tasks.pdf_export import export_screening_pdf_task
 
 router = APIRouter(prefix="/screening", tags=["screening"])
+logger = get_logger("simandou.screening")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -221,7 +225,7 @@ def screening_simple(
                 raise
             except Exception as e:
                 db.rollback()
-                print("[SCREENING/SIMPLE] _create_case_minimal FAILED:", tb.format_exc())
+                logger.exception("screening_simple_create_case_failed")
                 raise HTTPException(500, f"Failed to create case: {e}")
 
         meta = {
@@ -249,7 +253,7 @@ def screening_simple(
                 meta=meta,
             )
         except Exception as e:
-            print("[SCREENING/SIMPLE] run_simple_screening FAILED:", tb.format_exc())
+            logger.exception("screening_engine_failed")
             raise HTTPException(500, f"Screening engine error: {e}")
 
         request_id = _extract_request_id(out)
@@ -271,8 +275,8 @@ def screening_simple(
                     {"case_id": case_id, "client_id": payload.client_id, "rid": str(request_id)},
                 )
                 db.commit()
-            except Exception as e:
-                print("[SCREENING/SIMPLE] UPDATE screening_requests FAILED (non-bloquant):", e)
+            except Exception:
+                logger.exception("screening_requests_update_failed_non_blocking")
                 db.rollback()
 
         return ScreeningCheckOut(**out)
@@ -280,7 +284,7 @@ def screening_simple(
     except HTTPException:
         raise
     except Exception as e:
-        print("[SCREENING/SIMPLE] UNEXPECTED ERROR:", tb.format_exc())
+        logger.exception("screening_simple_unexpected_error")
         raise HTTPException(500, f"Unexpected error: {e}")
 
 
@@ -350,7 +354,7 @@ def screening_from_document(
                 raise
             except Exception as e:
                 db.rollback()
-                print("[FROM-DOC] _create_case_minimal FAILED:", tb.format_exc())
+                logger.exception("from_doc_create_case_failed")
                 raise HTTPException(500, f"Failed to create/attach case: {e}")
 
         # Prefill du case (non-bloquant)
@@ -362,7 +366,7 @@ def screening_from_document(
                 overwrite=False,
             )
         except Exception:
-            print("[FROM-DOC] apply_ocr_prefill_to_case failed (non-bloquant):", tb.format_exc())
+            logger.exception("from_doc_ocr_prefill_failed_non_blocking")
             db.rollback()
 
         # ✅ FIX CRITIQUE: re-poser le tenant context après le rollback éventuel du prefill
@@ -373,7 +377,10 @@ def screening_from_document(
         if not name:
             raise HTTPException(status_code=422, detail="No name extracted. Provide override_name.")
 
-        print(f"[FROM-DOC] name={name!r} case_id={case_id} doc_id={doc.id} tenant={tenant_id}")
+        logger.info(
+            "from_doc_screening_start",
+            extra={"name": name, "case_id": case_id, "doc_id": str(doc.id), "tenant_id": tenant_id},
+        )
 
         out = run_simple_screening(
             db=db,
@@ -392,8 +399,7 @@ def screening_from_document(
     except HTTPException:
         raise
     except Exception as e:
-        # ✅ FIX: log le vrai traceback — plus de 500 silencieux
-        print("[FROM-DOC] UNEXPECTED ERROR:", tb.format_exc())
+        logger.exception("from_doc_unexpected_error")
         raise HTTPException(500, f"screening_from_document error: {e}")
 
 
@@ -448,16 +454,19 @@ def export_pdf(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
+    """
+    Génération PDF synchrone. Conserve le contrat historique.
+    À utiliser pour les petits rapports. Pour les gros, préférer /export.pdf/async.
+    """
     tenant_id = _require_tenant_id(user)
     set_tenant_context(db, tenant_id)
 
     try:
-        # ✅ FIX: build_screening_pdf ne prend PAS tenant_id en paramètre
         pdf_bytes = build_screening_pdf(db, str(request_id))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        print("[export_pdf] ERROR:", tb.format_exc())
+        logger.exception("export_pdf_failed", extra={"request_id": str(request_id)})
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
 
     return Response(
@@ -466,5 +475,141 @@ def export_pdf(
         headers={
             "Content-Disposition": f'attachment; filename="screening-{request_id}.pdf"',
             "Content-Length": str(len(pdf_bytes)),
+        },
+    )
+
+
+# ─── Async PDF (S2) ───────────────────────────────────────────────────────────
+
+@router.post("/{request_id}/export.pdf/async", status_code=202)
+def export_pdf_async(
+    request_id: UUID,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Enqueue la génération PDF.
+
+    Retourne 202 + {"job_id": "...", "status_url": "/screening/jobs/<id>"}.
+
+    Le client doit:
+      1. Poller GET /screening/jobs/<job_id> jusqu'à status == "SUCCESS"
+      2. Télécharger via GET /screening/jobs/<job_id>/download
+
+    En mode eager (pas de broker) le job s'exécute inline mais l'API renvoie
+    quand même un job_id consultable (résultat déjà disponible).
+    """
+    tenant_id = _require_tenant_id(user)
+
+    # Vérifie que le screening existe et appartient au tenant (RLS le fera aussi,
+    # mais on veut un 404 propre côté API plutôt qu'une tâche qui crashera dans 5min)
+    set_tenant_context(db, tenant_id)
+    exists = db.execute(
+        text("SELECT 1 FROM screening_requests WHERE id = CAST(:rid AS uuid) LIMIT 1"),
+        {"rid": str(request_id)},
+    ).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail="Screening request not found")
+
+    async_result = export_screening_pdf_task.delay(str(request_id), tenant_id)
+    logger.info(
+        "export_pdf_enqueued",
+        extra={
+            "request_id": str(request_id),
+            "job_id": async_result.id,
+            "eager": settings.celery_eager,
+        },
+    )
+    return {
+        "job_id": async_result.id,
+        "status_url": f"/screening/jobs/{async_result.id}",
+        "download_url": f"/screening/jobs/{async_result.id}/download",
+        "eager": settings.celery_eager,
+    }
+
+
+@router.get("/jobs/{job_id}")
+def get_job_status(
+    job_id: str,
+    user=Depends(get_current_user),
+):
+    """
+    Status d'un job Celery.
+
+    Réponses:
+      - {"status": "PENDING"}                # pas encore traité
+      - {"status": "STARTED"}                # en cours
+      - {"status": "SUCCESS", "result": {…}} # PDF prêt
+      - {"status": "FAILURE", "error": "…"}  # erreur, voir logs
+    """
+    _require_tenant_id(user)
+    res = AsyncResult(job_id, app=celery_app)
+
+    payload: dict[str, Any] = {"job_id": job_id, "status": res.status}
+
+    if res.successful():
+        payload["result"] = res.result
+        # NB: on ne vérifie pas que le job appartient au tenant via le payload
+        # (Celery ne stocke pas le contexte HTTP). La protection est dans
+        # /download : le download impose le tenant courant.
+    elif res.failed():
+        payload["error"] = str(res.result) if res.result else "unknown"
+
+    return payload
+
+
+@router.get("/jobs/{job_id}/download")
+def download_job_result(
+    job_id: str,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Stream le PDF généré par le job. Vérifie l'appartenance tenant.
+    """
+    tenant_id = _require_tenant_id(user)
+    res = AsyncResult(job_id, app=celery_app)
+
+    if not res.successful():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job not ready (status={res.status}). Poll /screening/jobs/{job_id} first.",
+        )
+
+    result = res.result or {}
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail="Malformed job result")
+
+    if str(result.get("tenant_id")) != str(tenant_id):
+        # Le job appartient à un autre tenant — masque pour ne pas leak l'existence
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    object_key = result.get("object_key")
+    if not object_key:
+        raise HTTPException(status_code=500, detail="Job result has no object_key")
+
+    storage = get_storage()
+
+    # Si S3 + presign disponible, redirige directement
+    presigned = storage.presign_get(object_key, settings.PRESIGNED_URL_TTL_SECONDS)
+    if presigned:
+        return JSONResponse(
+            status_code=307,
+            content={"url": presigned},
+            headers={"Location": presigned},
+        )
+
+    # Sinon stream depuis le storage local
+    try:
+        f = storage.open(object_key)
+    except FileNotFoundError:
+        raise HTTPException(status_code=410, detail="Generated PDF expired or removed")
+
+    request_id = result.get("request_id", job_id)
+    return Response(
+        content=f.read(),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="screening-{request_id}.pdf"',
         },
     )

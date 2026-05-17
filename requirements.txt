@@ -67,6 +67,10 @@ pycparser==2.23
 pydantic==2.10.3
 pydantic-settings==2.6.1
 pydantic_core==2.27.1
+slowapi==0.1.9
+sentry-sdk[fastapi]==2.18.0
+celery==5.4.0
+redis==5.2.1
 Pygments==2.19.2
 PyJWT==2.10.1
 anthropic>=0.25.0
