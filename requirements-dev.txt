@@ -1,0 +1,17 @@
+# requirements-dev.txt — uniquement pour le dev/CI, jamais en prod.
+# Install: pip install -r requirements.txt -r requirements-dev.txt
+
+# Test framework
+pytest==8.3.4
+pytest-cov==6.0.0
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+
+# HTTP client pour tester l'API FastAPI (déjà tiré par fastapi mais on pin pour les tests)
+httpx==0.28.1
+
+# Postgres jetable pour les tests d'intégration (RLS, pg_trgm)
+testcontainers[postgres]==4.9.0
+
+# Lint / format (cohérent avec ruff)
+ruff==0.9.3
