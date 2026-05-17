@@ -976,11 +976,19 @@ def export_screenings_csv(
 
     sql += """
         ORDER BY sr.created_at DESC NULLS LAST
-        LIMIT 10000
     """
+    # Plus de LIMIT en dur — le streaming évite l'OOM. On garde un hard-cap
+    # défensif à 1 000 000 lignes pour ne pas saturer le client / le worker.
+    sql += "\n        LIMIT 1000000\n"
 
+    # Streaming réel : curseur côté serveur + yield ligne par ligne.
+    # SQLAlchemy 2.0 : execution_options(stream_results=True) pour ne pas
+    # tout buffer côté driver (utilise un server-side cursor psycopg).
     try:
-        rows = db.execute(text(sql), params).mappings().all()
+        result = db.execute(
+            text(sql).execution_options(stream_results=True, yield_per=500),
+            params,
+        )
     except Exception as e:
         try:
             db.rollback()
@@ -988,10 +996,7 @@ def export_screenings_csv(
             pass
         raise HTTPException(500, f"Failed to export screenings: {e}")
 
-    output = StringIO()
-    writer = csv.writer(output)
-
-    writer.writerow([
+    HEADERS = [
         "Screening ID",
         "Name",
         "Risk Level",
@@ -1005,67 +1010,75 @@ def export_screenings_csv(
         "Client ID",
         "Created At",
         "Completed At",
-    ])
+    ]
 
-    for row in rows:
-        payload = row.get("request_payload") or {}
-        if not isinstance(payload, dict):
-            payload = {}
+    def iter_csv():
+        buf = StringIO()
+        writer = csv.writer(buf)
 
-        case_payload = row.get("case_payload") or {}
-        if not isinstance(case_payload, dict):
-            case_payload = {}
+        writer.writerow(HEADERS)
+        yield buf.getvalue()
+        buf.seek(0); buf.truncate()
 
-        first_name = (
-            _safe_str(payload.get("first_name"))
-            or _safe_str(payload.get("firstName"))
-            or _safe_str(case_payload.get("first_name"))
-            or _safe_str(case_payload.get("firstName"))
-            or ""
-        )
+        for row in result.mappings():
+            payload = row.get("request_payload") or {}
+            if not isinstance(payload, dict):
+                payload = {}
 
-        last_name = (
-            _safe_str(payload.get("last_name"))
-            or _safe_str(payload.get("lastName"))
-            or _safe_str(case_payload.get("last_name"))
-            or _safe_str(case_payload.get("lastName"))
-            or ""
-        )
+            case_payload = row.get("case_payload") or {}
+            if not isinstance(case_payload, dict):
+                case_payload = {}
 
-        full_from_parts = f"{first_name} {last_name}".strip()
+            first_name = (
+                _safe_str(payload.get("first_name"))
+                or _safe_str(payload.get("firstName"))
+                or _safe_str(case_payload.get("first_name"))
+                or _safe_str(case_payload.get("firstName"))
+                or ""
+            )
 
-        client_name = (
-            _case_display_name(case_payload)
-            or _safe_str(payload.get("override_name"))
-            or _safe_str(payload.get("name"))
-            or _client_name_from_payload(payload)
-            or full_from_parts
-            or ""
-        )
+            last_name = (
+                _safe_str(payload.get("last_name"))
+                or _safe_str(payload.get("lastName"))
+                or _safe_str(case_payload.get("last_name"))
+                or _safe_str(case_payload.get("lastName"))
+                or ""
+            )
 
-        item_kind = (
-            _safe_str(payload.get("kind"))
-            or _safe_str(payload.get("trigger"))
-            or ""
-        )
+            full_from_parts = f"{first_name} {last_name}".strip()
 
-        writer.writerow([
-            row.get("id") or "",
-            client_name,
-            row.get("risk_level") or "",
-            row.get("status") or "",
-            row.get("provider") or "",
-            item_kind,
-            row.get("confidence") or "",
-            row.get("recommended_action") or "",
-            row.get("matches_count") or 0,
-            row.get("case_id") or "",
-            row.get("client_id") or "",
-            row.get("created_at") or "",
-            row.get("completed_at") or "",
-        ])
+            client_name = (
+                _case_display_name(case_payload)
+                or _safe_str(payload.get("override_name"))
+                or _safe_str(payload.get("name"))
+                or _client_name_from_payload(payload)
+                or full_from_parts
+                or ""
+            )
 
-    output.seek(0)
+            item_kind = (
+                _safe_str(payload.get("kind"))
+                or _safe_str(payload.get("trigger"))
+                or ""
+            )
+
+            writer.writerow([
+                row.get("id") or "",
+                client_name,
+                row.get("risk_level") or "",
+                row.get("status") or "",
+                row.get("provider") or "",
+                item_kind,
+                row.get("confidence") or "",
+                row.get("recommended_action") or "",
+                row.get("matches_count") or 0,
+                row.get("case_id") or "",
+                row.get("client_id") or "",
+                row.get("created_at") or "",
+                row.get("completed_at") or "",
+            ])
+            yield buf.getvalue()
+            buf.seek(0); buf.truncate()
 
     risk_part = risk_norm.lower() if risk_norm else "all"
     status_part = status_norm.lower() if status_norm else "all"
@@ -1075,10 +1088,11 @@ def export_screenings_csv(
     filename = f"screenings_{risk_part}_{status_part}{range_part}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
 
     return StreamingResponse(
-        output,
+        iter_csv(),
         media_type="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
         },
     )
 

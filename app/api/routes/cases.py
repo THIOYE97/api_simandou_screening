@@ -1,17 +1,18 @@
 from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import JSONResponse 
+from fastapi.responses import JSONResponse
+from sqlalchemy import String, cast, select, text
 from sqlalchemy.orm import Session
-from sqlalchemy import text, String, cast
-from app.api.deps.db import get_db_rls as get_db
+
 from app.api.deps.auth import get_current_user
-
-
-from app.schemas.cases import CaseCreate, CaseOut, CaseUpdate, CaseDetail
-from app.schemas.persons import PersonUpsert, PersonOut
-from app.schemas.companies import CompanyUpsert, CompanyOut, CompanyPersonCreate
-from app.services import cases_service
+from app.api.deps.db import get_db_rls as get_db
+from app.core.pagination import DEFAULT_LIMIT, MAX_LIMIT, keyset_paginate
 from app.models.case import Case
+from app.schemas.cases import CaseCreate, CaseDetail, CaseOut, CaseUpdate
+from app.schemas.companies import CompanyOut, CompanyPersonCreate, CompanyUpsert
+from app.schemas.persons import PersonOut, PersonUpsert
+from app.services import cases_service
 
 
 # ✅ dépendance globale: tout /cases nécessite un token
@@ -44,18 +45,42 @@ def create_case(
 def list_cases(
     status: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque keyset cursor. Use the next_cursor from the previous response.",
+    ),
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
     db: Session = Depends(get_db),
 ):
-    query = db.query(Case)
-    if status:
-        query = query.filter(Case.status == status)
-    if q:
-        query = query.filter(cast(Case.id, String).ilike(f"%{q}%"))
+    """
+    Liste paginée des cases.
 
-    cases = query.order_by(Case.created_at.desc()).all()
+    Réponse :
+      {
+        "items":       [...],
+        "next_cursor": "..." | null,
+        "has_more":    bool
+      }
+
+    Tri stable : (created_at DESC, id DESC). Le `cursor` est opaque côté client.
+    """
+    base = select(Case)
+    if status:
+        base = base.where(Case.status == status)
+    if q:
+        base = base.where(cast(Case.id, String).ilike(f"%{q}%"))
+
+    page = keyset_paginate(
+        db,
+        base_query=base,
+        order_by=[Case.created_at.desc(), Case.id.desc()],
+        limit=limit,
+        cursor=cursor,
+    )
+    cases = page.items
 
     if not cases:
-        return JSONResponse(content=[])
+        return JSONResponse(content={"items": [], "next_cursor": None, "has_more": False})
 
     case_ids = [str(c.id) for c in cases]
 
@@ -122,10 +147,10 @@ def list_cases(
         try: return v.isoformat()
         except Exception: return str(v)
 
-    result = []
+    items = []
     for c in cases:
         cid = str(c.id)
-        result.append({
+        items.append({
             "id":          cid,
             "case_type":   _str(getattr(c, "case_type",  None)),
             "status":      _str(getattr(c, "status",     None)),
@@ -137,7 +162,11 @@ def list_cases(
             "client_name": name_by_case.get(cid),   # str | None
         })
 
-    return JSONResponse(content=result)
+    return JSONResponse(content={
+        "items": items,
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+    })
 
 
 @router.get("/{case_id}", response_model=CaseDetail)

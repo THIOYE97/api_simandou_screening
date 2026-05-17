@@ -10,6 +10,7 @@ from app.models.tenant import Tenant
 from app.models.user_role import UserRole
 from app.models.tenant_invitation import TenantInvitation
 from app.models.document import Document
+from app.models.refresh_token import RefreshToken
 
 def load_all_models() -> None:
     package_name = __name__
@@ -22,4 +23,4 @@ def load_all_models() -> None:
             continue
         importlib.import_module(f"{package_name}.{module_name}")
 
-__all__ = ["User", "Tenant", "UserRole", "TenantInvitation", "Document"]
+__all__ = ["User", "Tenant", "UserRole", "TenantInvitation", "Document", "RefreshToken"]

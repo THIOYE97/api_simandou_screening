@@ -23,6 +23,11 @@ class User(Base):
 
     is_active = Column(Boolean, nullable=False, server_default="true")
 
+    # ✅ statut applicatif (utilisé par /auth + assert_user_and_tenant_active).
+    # Valeurs observées dans le code : ACTIVE | DISABLED | PENDING_INVITE
+    # Stocké en TEXT (pas d'enum PG dédié pour rester rétro-compat).
+    status = Column(Text, nullable=False, server_default="ACTIVE")
+
     # ✅ multi-tenant
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=True, index=True)
     tenant = relationship("Tenant", lazy="joined")

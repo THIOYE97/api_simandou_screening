@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Git
+.git/
+.gitignore
+.github/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# Local secrets — JAMAIS dans l'image
+.env
+.env.*
+!.env.example
+
+# Local data
+uploads/
+storage/
+data/
+*.log
+*.bak
+*.tmp
+
+# Migrations backup
+alembic.bak.*/
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Tests
+test_*.sh
+=1.7.0
+
+# Docs
+README.md
+*.md
+!README.dockerhub.md
+
+# OS
+.DS_Store
+Thumbs.db
