@@ -26,6 +26,13 @@ from app.models.base import Base  # noqa
 import app.models.watchlist  # noqa
 import app.models.screening_db  # noqa
 import app.models.audit  # noqa
+import app.models.referentiel  # noqa
+import app.models.scoring  # noqa
+import app.models.alerting  # noqa
+import app.models.kyt  # noqa
+import app.models.rbac  # noqa
+import app.models.adverse_media  # noqa
+import app.models.compliance  # noqa
 
 target_metadata = Base.metadata
 

@@ -22,12 +22,20 @@ init_sentry()
 # --- Routers (import après setup_logging) ---
 from app.api.routes import admin  # noqa: E402
 from app.api.routes.admin_tenants import router as admin_tenants_router  # noqa: E402
+from app.api.routes.adverse_media import router as adverse_media_router  # noqa: E402
+from app.api.routes.alerting import router as alerting_router  # noqa: E402
 from app.api.routes.analyst import router as analyst_router  # noqa: E402
 from app.api.routes.auth import router as auth_router  # noqa: E402
 from app.api.routes.cascade import router as cascade_router  # noqa: E402
 from app.api.routes.cases import router as cases_router  # noqa: E402
 from app.api.routes.documents import router as documents_router  # noqa: E402
 from app.api.routes.health import router as health_router  # noqa: E402
+from app.api.routes.integration import router as integration_router  # noqa: E402
+from app.api.routes.kyt import router as kyt_router  # noqa: E402
+from app.api.routes.rbac import router as rbac_router  # noqa: E402
+from app.api.routes.referentiel import router as referentiel_router  # noqa: E402
+from app.api.routes.reporting import router as reporting_router  # noqa: E402
+from app.api.routes.scoring import router as scoring_router  # noqa: E402
 from app.api.routes.screening import router as screening_router  # noqa: E402
 from app.api.routes.settings_routes import router as settings_router  # noqa: E402
 
@@ -99,3 +107,11 @@ app.include_router(cascade_router)
 app.include_router(analyst_router)
 app.include_router(admin_tenants_router)
 app.include_router(settings_router)
+app.include_router(referentiel_router)
+app.include_router(scoring_router)
+app.include_router(alerting_router)
+app.include_router(kyt_router)
+app.include_router(reporting_router)
+app.include_router(integration_router)
+app.include_router(rbac_router)
+app.include_router(adverse_media_router)

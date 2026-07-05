@@ -53,6 +53,11 @@ case "$ROLE" in
     exec alembic upgrade head
     ;;
 
+  seed)
+    echo "[entrypoint] seeding referentiel + users (conformité / analyste)"
+    exec python -m app.scripts.seed_users
+    ;;
+
   shell)
     exec bash
     ;;

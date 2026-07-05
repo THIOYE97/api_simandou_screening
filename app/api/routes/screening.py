@@ -21,7 +21,7 @@ from app.models.document import Document, OCRStatus
 from app.models.screening_db import ScreeningRequest, ScreeningResult, ScreeningMatch
 from app.schemas.screening import ScreeningCheckIn, ScreeningCheckOut
 from app.services.documents_service import apply_ocr_prefill_to_case
-from app.services.export_pdf_service import build_screening_pdf
+from app.services.pdf_report import build_screening_pdf
 from app.services.simple_screening_engine import run_simple_screening
 from app.services.storage import get_storage
 from app.tasks.pdf_export import export_screening_pdf_task
@@ -277,6 +277,19 @@ def screening_simple(
                 db.commit()
             except Exception:
                 logger.exception("screening_requests_update_failed_non_blocking")
+                db.rollback()
+
+            # Match → dossier transmis à la Conformité (Alertes). Non bloquant.
+            try:
+                from app.services.screening_alerts import raise_alerts_for_screening
+                set_tenant_context(db, tenant_id)
+                raise_alerts_for_screening(
+                    db, request_id=str(request_id), subject_label=name,
+                    entity_type=payload.entity_type,
+                    tenant_id=tenant_id, created_by=created_by,
+                )
+            except Exception:
+                logger.exception("screening_raise_alerts_failed_non_blocking")
                 db.rollback()
 
         return ScreeningCheckOut(**out)

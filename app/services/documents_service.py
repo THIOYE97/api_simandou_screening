@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -11,9 +12,11 @@ from fastapi import HTTPException, UploadFile
 from sqlalchemy import text, update
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.case import Case
 from app.models.document import Document, OCRStatus, StorageBackend
 from app.services.local_ocr_service import run_local_ocr
+from app.services.storage import get_storage
 
 # ─────────────────────────────────────────────
 # Storage root
@@ -113,24 +116,40 @@ def apply_ocr_prefill_to_case(
 # File upload helpers (shared)
 # ─────────────────────────────────────────────
 
-async def _write_upload(file: UploadFile, dest: Path) -> tuple[int, str]:
-    """Écrit le fichier uploadé sur disque, retourne (size_bytes, sha256_hex)."""
-    sha       = hashlib.sha256()
-    size      = 0
-    dest.parent.mkdir(parents=True, exist_ok=True)
+def _active_backend() -> str:
+    return (settings.STORAGE_BACKEND or "LOCAL").upper()
 
+
+async def _store_upload(file: UploadFile, obj_key: str) -> tuple[int, str, str, str | None]:
+    """
+    Lit le fichier uploadé et le stocke selon le backend configuré :
+    - LOCAL : écrit sur disque (UPLOAD_ROOT) ;
+    - S3    : envoie sur le bucket via la couche de stockage.
+    Retourne (size_bytes, sha256_hex, backend, file_path|None).
+    """
+    sha = hashlib.sha256()
+    size = 0
+    buf = bytearray()
+    while chunk := await file.read(1024 * 1024):
+        buf.extend(chunk)
+        sha.update(chunk)
+        size += len(chunk)
+    data = bytes(buf)
+
+    backend = _active_backend()
     try:
-        with dest.open("wb") as out:
-            while chunk := await file.read(1024 * 1024):
-                out.write(chunk)
-                sha.update(chunk)
-                size += len(chunk)
+        if backend == "S3":
+            get_storage().save(obj_key, data, file.content_type)
+            file_path = None
+        else:
+            dest = _local_path(obj_key)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            file_path = str(dest)
     except Exception as e:
-        if dest.exists():
-            dest.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
-    return size, sha.hexdigest()
+    return size, sha.hexdigest(), backend, file_path
 
 
 # ─────────────────────────────────────────────
@@ -149,19 +168,17 @@ async def save_document(
     doc_id   = uuid4()
     original = _safe_filename(file.filename or "upload.bin")
     obj_key  = f"cases/{case_id}/{doc_id}_{original}"
-    dest     = _local_path(obj_key)
 
-    size, sha256 = await _write_upload(file, dest)
-    print("[upload case] saved:", dest, "| exists:", dest.exists())
+    size, sha256, backend, file_path = await _store_upload(file, obj_key)
 
     doc = Document(
         id=doc_id,
         tenant_id=tenant_id,
         case_id=case_id,
         doc_type=doc_type,
-        storage_backend=StorageBackend.LOCAL.value,
+        storage_backend=backend,
         object_key=obj_key,
-        file_path=str(dest),
+        file_path=file_path,
         original_filename=original,
         mime_type=file.content_type,
         size_bytes=size,
@@ -179,7 +196,10 @@ async def save_document(
         return doc
     except Exception as e:
         db.rollback()
-        dest.unlink(missing_ok=True)
+        try:
+            get_storage().delete(obj_key)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"Failed to create document: {e}")
 
 
@@ -207,19 +227,17 @@ async def save_document_standalone(
     doc_id   = uuid4()
     original = _safe_filename((file.filename or "upload.bin").strip())
     obj_key  = f"standalone/{doc_id}_{original}"
-    dest     = _local_path(obj_key)
 
-    size, sha256 = await _write_upload(file, dest)
-    print("[upload standalone] saved:", dest, "| exists:", dest.exists())
+    size, sha256, backend, file_path = await _store_upload(file, obj_key)
 
     doc = Document(
         id=doc_id,
         tenant_id=tenant_id,
         case_id=None,
         doc_type=doc_type,
-        storage_backend=StorageBackend.LOCAL.value,
+        storage_backend=backend,
         object_key=obj_key,
-        file_path=str(dest),
+        file_path=file_path,
         original_filename=original,
         mime_type=(file.content_type or "application/octet-stream"),
         size_bytes=size,
@@ -237,7 +255,10 @@ async def save_document_standalone(
         return doc
     except Exception as e:
         db.rollback()
-        dest.unlink(missing_ok=True)
+        try:
+            get_storage().delete(obj_key)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"Failed to create document: {e}")
 
 
@@ -268,20 +289,32 @@ def get_document(db: Session, doc_id: UUID) -> Document:
 def extract_document_fields_local(db: Session, doc_id: UUID) -> Document:
     doc = get_document(db, doc_id)
 
-    backend = (getattr(doc, "storage_backend", None) or "").upper()
-    if backend != StorageBackend.LOCAL.value:
-        raise ValueError(f"Local OCR only supports LOCAL storage_backend (got {doc.storage_backend!r})")
+    backend = (getattr(doc, "storage_backend", None) or "LOCAL").upper()
+    tmp_path: Optional[Path] = None
 
-    if not getattr(doc, "file_path", None):
-        raise ValueError("file_path missing on document record")
-
-    file_path = Path(doc.file_path)
-    print("[ocr] will read:", file_path, "| exists:", file_path.exists())
-
-    if not file_path.exists():
-        db.execute(update(Document).where(Document.id == doc_id).values(ocr_status=OCRStatus.FAILED))
-        db.commit()
-        raise ValueError(f"File not found on disk: {file_path}")
+    if backend == StorageBackend.S3.value:
+        # Télécharge le fichier depuis S3 vers un fichier temporaire pour l'OCR.
+        try:
+            body = get_storage().open(doc.object_key)
+            data = body.read() if hasattr(body, "read") else bytes(body)
+        except Exception as e:
+            db.execute(update(Document).where(Document.id == doc_id).values(ocr_status=OCRStatus.FAILED))
+            db.commit()
+            raise ValueError(f"Impossible de lire le fichier depuis S3: {e}")
+        suffix = Path(doc.object_key or "").suffix or ".bin"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(data)
+        tmp.close()
+        tmp_path = Path(tmp.name)
+        file_path = tmp_path
+    else:
+        if not getattr(doc, "file_path", None):
+            raise ValueError("file_path missing on document record")
+        file_path = Path(doc.file_path)
+        if not file_path.exists():
+            db.execute(update(Document).where(Document.id == doc_id).values(ocr_status=OCRStatus.FAILED))
+            db.commit()
+            raise ValueError(f"File not found on disk: {file_path}")
 
     try:
         result = run_local_ocr(file_path)
@@ -289,6 +322,12 @@ def extract_document_fields_local(db: Session, doc_id: UUID) -> Document:
         db.execute(update(Document).where(Document.id == doc_id).values(ocr_status=OCRStatus.FAILED))
         db.commit()
         raise ValueError(f"OCR engine error: {type(e).__name__}: {e}")
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     new_status = OCRStatus.DONE if result.confidence >= 0.65 else OCRStatus.LOW_CONFIDENCE
 
