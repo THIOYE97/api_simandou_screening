@@ -66,20 +66,17 @@ def _column_exists(bind, table: str, column: str) -> bool:
 
 
 def upgrade() -> None:
-    # CONCURRENTLY exige AUTOCOMMIT (pas de transaction)
-    bind = op.get_bind().execution_options(isolation_level="AUTOCOMMIT")
-
+    # NB : on crée les index DANS la transaction Alembic (pas de CONCURRENTLY).
+    # CONCURRENTLY exigerait de sortir de la transaction (AUTOCOMMIT), ce qui
+    # n'est pas possible sur la connexion déjà ouverte par Alembic. Les tables
+    # restant modestes, le lock bref d'un CREATE INDEX classique est acceptable.
+    bind = op.get_bind()
     for table, name, cols in INDEXES:
         if not _column_exists(bind, table, "tenant_id"):
-            bind.exec_driver_sql(
-                f"-- SKIP: {table}.tenant_id not present in current schema"
-            )
             continue
-        sql = f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{name}" ON "{table}" {cols}'
-        bind.exec_driver_sql(sql)
+        op.execute(f'CREATE INDEX IF NOT EXISTS "{name}" ON "{table}" {cols}')
 
 
 def downgrade() -> None:
-    bind = op.get_bind().execution_options(isolation_level="AUTOCOMMIT")
     for _table, name, _cols in INDEXES:
-        bind.exec_driver_sql(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+        op.execute(f'DROP INDEX IF EXISTS "{name}"')
