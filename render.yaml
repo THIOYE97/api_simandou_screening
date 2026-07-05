@@ -1,0 +1,90 @@
+# ============================================================================
+# render.yaml — Blueprint Render pour l'API Simandou Screening (LBC/FT BCRG).
+#
+# Reconfigure entièrement le service web :
+#   - build via build.sh (pip install)
+#   - migrations Alembic en pré-déploiement (alembic upgrade head)
+#   - démarrage gunicorn/uvicorn
+#   - disque persistant pour les fichiers d'upload (survivent aux redéploiements)
+#
+# Mode de stockage : LOCAL sur disque persistant (choix "bypass staging").
+#   Pour basculer en S3 plus tard : mettre STORAGE_BACKEND=S3 + S3_* et
+#   ENVIRONMENT=production (le validateur exigera alors des secrets forts).
+#
+# Variables à saisir à la main dans le dashboard (sync: false) :
+#   - DATABASE_URL      (garder la base EXISTANTE — format postgresql+psycopg://…)
+#   - ANTHROPIC_API_KEY (facultatif : OCR Claude Vision)
+# ============================================================================
+services:
+  - type: web
+    name: api-simandou-screening
+    runtime: python
+    plan: starter
+    region: frankfurt
+    branch: main
+    buildCommand: ./build.sh
+    # Migrations appliquées AVANT que le nouveau code ne prenne le trafic.
+    preDeployCommand: alembic upgrade head
+    startCommand: >-
+      gunicorn app.main:app
+      --bind 0.0.0.0:$PORT
+      --workers ${GUNICORN_WORKERS:-2}
+      --worker-class uvicorn.workers.UvicornWorker
+      --timeout ${GUNICORN_TIMEOUT:-60}
+      --graceful-timeout 30 --keep-alive 5
+      --max-requests 1000 --max-requests-jitter 100
+      --access-logfile - --error-logfile -
+    healthCheckPath: /healthz
+    # Disque persistant : garde les uploads (justificatifs) entre les déploiements.
+    disk:
+      name: uploads
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      # --- Environnement (bypass staging : lève le validateur de secrets) ----
+      - key: ENVIRONMENT
+        value: staging
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_JSON
+        value: "true"
+      - key: PYTHON_VERSION
+        value: 3.12.8
+
+      # --- Secrets (générés + persistés par Render, jamais dans le repo) ------
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_TOKEN
+        generateValue: true
+
+      # --- Base de données (garder l'EXISTANTE — à coller dans le dashboard) --
+      - key: DATABASE_URL
+        sync: false
+      - key: AUTH_BYPASS_ROLE
+        value: auth_bypass_rls
+
+      # --- Stockage : LOCAL sur disque persistant ----------------------------
+      - key: STORAGE_BACKEND
+        value: LOCAL
+      - key: LOCAL_STORAGE_ROOT
+        value: /var/data/uploads
+
+      # --- Rate limit désactivé (évite le bug slowapi sur /login) ------------
+      - key: RATE_LIMIT_ENABLED
+        value: "false"
+
+      # --- Gunicorn ----------------------------------------------------------
+      - key: GUNICORN_WORKERS
+        value: "2"
+      - key: GUNICORN_TIMEOUT
+        value: "60"
+
+      # --- OCR Claude Vision (facultatif) ------------------------------------
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+      # --- Seed des 2 comptes (facultatif : surcharge les mots de passe) -----
+      # - key: SEED_COMPLIANCE_PASSWORD
+      #   sync: false
+      # - key: SEED_ANALYST_PASSWORD
+      #   sync: false
