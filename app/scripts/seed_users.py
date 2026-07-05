@@ -81,12 +81,19 @@ def main() -> None:
     finally:
         db.close()
 
-    # Tenant + utilisateurs : nécessite de contourner la RLS (comme l'auth applicative).
+    # Tenant + utilisateurs.
+    # La RLS de `users` est pilotée par le GUC `app.tenant_id` (pas par un rôle
+    # BYPASSRLS) : les policies INSERT/SELECT exigent
+    #   tenant_id = current_setting('app.tenant_id').
+    # On pose donc le contexte tenant avant d'écrire les utilisateurs.
+    # (`tenants` n'a pas de RLS → _ensure_tenant reste idempotent hors contexte.)
     with engine.begin() as conn:
         conn.execute(text(f"SET ROLE {settings.AUTH_BYPASS_ROLE}"))
         tenant_id = _ensure_tenant(conn)
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, false)"), {"t": tenant_id})
         conf_uid = _ensure_user(conn, conf_email, "Cellule de Conformité", conf_pwd, tenant_id)
         ana_uid = _ensure_user(conn, ana_email, "Analyste", ana_pwd, tenant_id)
+        conn.execute(text("SELECT set_config('app.tenant_id', '', false)"))
         conn.execute(text("RESET ROLE"))
 
     db = SessionLocal()
