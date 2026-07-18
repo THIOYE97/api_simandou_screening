@@ -392,7 +392,7 @@ def screening_from_document(
 
         logger.info(
             "from_doc_screening_start",
-            extra={"name": name, "case_id": case_id, "doc_id": str(doc.id), "tenant_id": tenant_id},
+            extra={"subject_name": name, "case_id": case_id, "doc_id": str(doc.id), "tenant_id": tenant_id},
         )
 
         out = run_simple_screening(
