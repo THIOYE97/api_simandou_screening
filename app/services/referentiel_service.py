@@ -106,18 +106,35 @@ def update_scenario(db: Session, scenario_id: UUID, data: dict) -> Optional[Risk
 # Données de démarrage (seed idempotent)
 # --------------------------------------------------------------------------
 
-# GAFI — liste noire (« appel à l'action ») + non coopératifs
+# ===========================================================================
+# Listes GAFI / FATF — INSTANTANÉ à réconcilier périodiquement.
+#
+# Source officielle : https://www.fatf-gafi.org (les listes sont révisées à
+# chaque plénière, ~3 fois par an). Cet instantané reflète l'état connu début
+# 2025. La Conformité DOIT le valider contre la dernière publication FATF ; les
+# indicateurs pays (haut risque / non coopératif / poids) restent éditables à
+# chaud via PATCH /referentiel/countries.
+# ===========================================================================
+
+# GAFI — « Juridictions à haut risque faisant l'objet d'un appel à l'action »
+# (liste noire). Stable depuis plusieurs années.
 _GAFI_BLACKLIST = [
     ("IR", "Iran"),
     ("KP", "Corée du Nord"),
     ("MM", "Myanmar"),
 ]
 
-# GAFI — surveillance renforcée (« liste grise ») — extrait représentatif
+# GAFI — « Juridictions sous surveillance renforcée » (liste grise).
 _GAFI_GREYLIST = [
-    ("SY", "Syrie"), ("YE", "Yémen"), ("CD", "Rép. dém. du Congo"),
-    ("ML", "Mali"), ("BF", "Burkina Faso"), ("SS", "Soudan du Sud"),
-    ("HT", "Haïti"), ("VE", "Venezuela"), ("MZ", "Mozambique"),
+    ("DZ", "Algérie"), ("AO", "Angola"), ("BG", "Bulgarie"),
+    ("BF", "Burkina Faso"), ("CM", "Cameroun"), ("CI", "Côte d'Ivoire"),
+    ("HR", "Croatie"), ("CD", "Rép. dém. du Congo"), ("HT", "Haïti"),
+    ("KE", "Kenya"), ("LA", "Laos"), ("LB", "Liban"),
+    ("ML", "Mali"), ("MC", "Monaco"), ("MZ", "Mozambique"),
+    ("NA", "Namibie"), ("NP", "Népal"), ("NG", "Nigéria"),
+    ("ZA", "Afrique du Sud"), ("SS", "Soudan du Sud"), ("SY", "Syrie"),
+    ("TZ", "Tanzanie"), ("VE", "Venezuela"), ("VN", "Viêt Nam"),
+    ("YE", "Yémen"),
 ]
 
 _DEFAULT_CLIENT_CATEGORIES = [
