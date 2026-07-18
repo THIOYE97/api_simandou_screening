@@ -82,7 +82,7 @@ Rules:
 - If nothing readable: {"confidence": 0.0}
 """
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = settings.ANTHROPIC_OCR_MODEL
 MAX_TOKENS = 512
 
 

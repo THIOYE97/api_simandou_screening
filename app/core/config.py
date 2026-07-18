@@ -68,6 +68,8 @@ class Settings(BaseSettings):
 
     # ---- Anthropic ---------------------------------------------------------
     ANTHROPIC_API_KEY: Optional[str] = None
+    # Modèle Claude Vision utilisé pour l'OCR (surchargeable sans redéploiement).
+    ANTHROPIC_OCR_MODEL: str = "claude-sonnet-5"
 
     # ---- Observability -----------------------------------------------------
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
