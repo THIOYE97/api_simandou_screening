@@ -80,14 +80,16 @@ DEFAULT_SETTINGS: dict = {
 # 6 et 7 sont les répertoires de personnes politiquement exposées de Guinée
 # (extraits du Secrétariat Général du Gouvernement).
 SOURCE_NAMES = {
-    1: "Nations Unies (ONU)",
-    2: "OFAC (US Treasury)",
-    3: "Union Européenne",
+    1: "Sanctions — Nations Unies (liste consolidée)",
+    2: "Sanctions — OFAC (Trésor américain)",
+    3: "Sanctions — Union Européenne",
+    4: "Sanctions — Royaume-Uni",
+    5: "PPE Guinée — Journal Officiel (SGG)",
     6: "PPE Guinée — Répertoire SGG",
-    7: "PPE Guinée — Membres du Gouvernement (5e République)",
+    7: "PPE Guinée — Membres du Gouvernement (Ve République)",
 }
-SOURCE_CODES = {1: "UN", 2: "OFAC", 3: "EU", 6: "GN-PEP-SGG", 7: "GN-PEP-GOV"}
-SOURCE_FLAGS = {1: "🌐", 2: "🇺🇸", 3: "🇪🇺", 6: "🇬🇳", 7: "🇬🇳"}
+SOURCE_CODES = {1: "UN", 2: "OFAC", 3: "EU", 4: "UK", 5: "SGG_GN", 6: "SGG", 7: "GN_GOV"}
+SOURCE_FLAGS = {1: "🌐", 2: "🇺🇸", 3: "🇪🇺", 4: "🇬🇧", 5: "🇬🇳", 6: "🇬🇳", 7: "🇬🇳"}
 
 
 # ─── GET /settings ────────────────────────────────────────────────────────────

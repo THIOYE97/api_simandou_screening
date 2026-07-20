@@ -64,11 +64,20 @@ def _screenable(name: Optional[str]) -> bool:
     return len(clean) >= 4 and len(clean.split()) >= 2
 
 
-def _screen_party(db: Session, *, name: str, role: str, country: Optional[str] = None) -> Optional[dict]:
+def _screen_party(
+    db: Session, *, name: str, role: str,
+    tenant_id: Optional[UUID] = None, country: Optional[str] = None,
+) -> Optional[dict]:
     """Confronte une partie à l'opération aux listes. None si rien d'exploitable."""
+    from app.core.db import set_tenant_context
     from app.services.simple_screening_engine import run_simple_screening
 
     try:
+        # Le moteur exige le contexte tenant (RLS). Chaque commit rend la
+        # connexion au pool et perd le GUC app.tenant_id : on le repose donc
+        # juste avant CHAQUE filtrage.
+        if tenant_id:
+            set_tenant_context(db, str(tenant_id))
         res = run_simple_screening(
             db=db, name=name.strip(), country_focus=country,
             meta={"trigger": "kyt.party_screening", "role": role},
@@ -104,7 +113,10 @@ def screen_parties(db: Session, txn: Transaction) -> list[dict]:
     for role, raw in (("Émetteur", txn.customer_ref), ("Bénéficiaire", txn.counterparty_name)):
         if not _screenable(raw):
             continue
-        hit = _screen_party(db, name=raw, role=role, country=txn.counterparty_country)
+        hit = _screen_party(
+            db, name=raw, role=role,
+            tenant_id=txn.tenant_id, country=txn.counterparty_country,
+        )
         if hit:
             out.append(hit)
     return out
@@ -146,6 +158,11 @@ def analyze_transaction(db: Session, txn: Transaction):
     # Filtrage sanctions/PPE de l'émetteur et du bénéficiaire : alimente les
     # scénarios SANCTION_MATCH_* et PEP_HIT, exactement comme en KYC/KYS.
     parties = screen_parties(db, txn)
+    if txn.tenant_id:
+        # Le moteur de filtrage committe : on rétablit le contexte RLS avant
+        # d'écrire l'évaluation et les alertes.
+        from app.core.db import set_tenant_context
+        set_tenant_context(db, str(txn.tenant_id))
     if parties:
         best = max(parties, key=lambda p: p["score"])
         ctx["match_score"] = best["score"]
