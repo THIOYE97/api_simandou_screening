@@ -10,7 +10,9 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import re
 import tempfile
+import xml.etree.ElementTree as ET
 from typing import Iterator
 
 import httpx
@@ -135,6 +137,82 @@ def _uk_accumulate(row: dict, grouped: dict[str, dict]) -> None:
 
 
 # --------------------------------------------------------------------------
+# Canada — Loi sur les mesures économiques spéciales (SEMA)
+# --------------------------------------------------------------------------
+# Structure établie sur le fichier réel : 5 684 <record> à plat.
+#   - personne : <LastName> + <GivenName> ;
+#   - entité ou navire : <EntityOrShip> ;
+#   - <Aliases> regroupe les alias en un seul texte ;
+#   - <Country> porte le RÉGIME de sanction (« Belarus / Bélarus »), pas la
+#     nationalité de la personne ;
+#   - aucun identifiant unique : la clé stable est (Country, Schedule, Item),
+#     vérifiée unique sur l'intégralité du fichier.
+CANADA_URL = (
+    "https://www.international.gc.ca/world-monde/assets/office_docs/"
+    "international_relations-relations_internationales/sanctions/sema-lmes.xml"
+)
+CANADA_SOURCE_CODE = "CA"
+CANADA_SOURCE_NAME = "Sanctions — Canada (LMES/SEMA)"
+
+
+def _text(node, tag: str) -> str:
+    el = node.find(tag)
+    return (el.text or "").strip() if el is not None and el.text else ""
+
+
+def _split_aliases(raw: str) -> list[str]:
+    """Les alias sont dans un texte unique, séparés par « ; », « / » ou une virgule."""
+    if not raw:
+        return []
+    parts = re.split(r"[;/]|,(?=\s*[A-ZÀ-Ý])", raw)
+    return [p.strip() for p in parts if p and len(p.strip()) > 2]
+
+
+def fetch_canada_sanctions(url: str = CANADA_URL) -> Iterator[dict]:
+    """Télécharge et analyse la liste canadienne (LMES/SEMA)."""
+    path = _download_to_file(url)
+    try:
+        for _, rec in ET.iterparse(path, events=("end",)):
+            if rec.tag != "record":
+                continue
+            regime = _text(rec, "Country")
+            entity = _text(rec, "EntityOrShip")
+            last, given = _text(rec, "LastName"), _text(rec, "GivenName")
+
+            if entity:
+                name, etype = entity, "company"
+            else:
+                name = " ".join(p for p in (given, last) if p)
+                etype = "person"
+            if not name:
+                rec.clear()
+                continue
+
+            ref = "|".join([regime, _text(rec, "Schedule"), _text(rec, "Item")])
+            yield {
+                "source_ref": ref,
+                "entity_type": etype,
+                "primary_name": name,
+                "aliases": _split_aliases(_text(rec, "Aliases")),
+                "program": regime or None,
+                "listed_on": _text(rec, "DateOfListing") or None,
+                "country": None,     # <Country> = régime, pas la nationalité
+                "summary": None,
+                "raw": {
+                    "schedule": _text(rec, "Schedule"), "item": _text(rec, "Item"),
+                    "dob": _text(rec, "DateOfBirthOrShipBuildDate"),
+                    "imo": _text(rec, "ShipIMONumber"),
+                },
+            }
+            rec.clear()          # libère la mémoire au fil de la lecture
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
 # Registre des adaptateurs
 # --------------------------------------------------------------------------
 ADAPTERS: dict[str, dict] = {
@@ -144,5 +222,12 @@ ADAPTERS: dict[str, dict] = {
         "record_type": "SANCTION",
         "url": UK_SANCTIONS_URL,
         "label": "Royaume-Uni — UK Sanctions List (FCDO)",
+    },
+    CANADA_SOURCE_CODE: {
+        "name": CANADA_SOURCE_NAME,
+        "fetch": fetch_canada_sanctions,
+        "record_type": "SANCTION",
+        "url": CANADA_URL,
+        "label": "Canada — Mesures économiques spéciales (LMES)",
     },
 }
