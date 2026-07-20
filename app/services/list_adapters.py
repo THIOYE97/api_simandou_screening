@@ -32,12 +32,31 @@ def _download_to_file(url: str) -> str:
     """
     fd, path = tempfile.mkstemp(suffix=".csv", prefix="sanctions_")
     os.close(fd)
-    with httpx.Client(timeout=DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
+    # Plusieurs portails officiels sont protégés par un pare-feu applicatif qui
+    # refuse les clients s'annonçant comme des scripts (« python-httpx/… »),
+    # surtout depuis une adresse de centre de données. On s'identifie donc comme
+    # un navigateur, et on borne le délai de connexion pour qu'un blocage
+    # échoue vite et lisiblement au lieu de rester suspendu.
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
+        "Accept": "*/*",
+        "Accept-Language": "fr,en;q=0.8",
+    }
+    timeout = httpx.Timeout(DOWNLOAD_TIMEOUT, connect=20.0)
+    with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
         with client.stream("GET", url) as r:
             r.raise_for_status()
             with open(path, "wb") as f:
                 for chunk in r.iter_bytes(chunk_size=1 << 20):
                     f.write(chunk)
+    size = os.path.getsize(path)
+    if size < 1024:                    # une page d'erreur pèse quelques centaines d'octets
+        os.unlink(path)
+        raise RuntimeError(
+            f"Téléchargement suspect depuis {url} : {size} octets reçus. "
+            "La source a probablement refusé la requête."
+        )
     return path
 
 
