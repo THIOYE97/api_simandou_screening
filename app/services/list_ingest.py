@@ -101,9 +101,10 @@ def ingest(
     """
     source_id = get_or_create_source(db, code=source_code, name=source_name, source_type=source_type)
     seen = _existing_refs(db, source_id)
-    created = skipped = 0
+    created = skipped = read = 0
 
     for rec in records:
+        read += 1
         ref = str(rec.get("source_ref") or "").strip()
         primary = (rec.get("primary_name") or "").strip()
         if not ref or not primary:
@@ -162,7 +163,7 @@ def ingest(
         created += 1
         if max_records and created >= max_records:
             db.commit()
-            return {"created": created, "skipped": skipped,
+            return {"created": created, "skipped": skipped, "read": read,
                     "source_id": source_id, "remaining": True}
         if created % BATCH == 0:
             db.commit()
@@ -172,4 +173,5 @@ def ingest(
                         extra={"source": source_code, "records_created": created})
 
     db.commit()
-    return {"created": created, "skipped": skipped, "source_id": source_id, "remaining": False}
+    return {"created": created, "skipped": skipped, "read": read,
+            "source_id": source_id, "remaining": False}

@@ -370,6 +370,18 @@ def fetch_dfat_sanctions(url: str = DFAT_URL) -> Iterator[dict]:
         rows = ws.iter_rows(values_only=True)
         header = [str(h or "").strip() for h in next(rows)]
 
+        # Un import qui ne remonte RIEN sans lever d'erreur est le pire des cas
+        # en conformité : on croit le contrôle fait alors qu'il ne l'est pas.
+        # Si la source change de format, on veut un message, pas un silence.
+        required = {"Reference", "Name of Individual or Entity", "Type", "Name Type"}
+        missing = required - set(header)
+        if missing:
+            raise RuntimeError(
+                "Colonnes absentes du classeur DFAT : "
+                + ", ".join(sorted(missing))
+                + f" — colonnes lues : {header[:8]}"
+            )
+
         def cell(row, key: str) -> str:
             try:
                 v = row[header.index(key)]

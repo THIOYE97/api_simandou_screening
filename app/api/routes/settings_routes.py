@@ -566,7 +566,15 @@ def import_source(
         "label": adapter.get("label"),
         "created": out["created"],
         "skipped": out["skipped"],
+        "read": out.get("read", 0),
         "remaining": out.get("remaining", False),
+        # Une source qui ne produit AUCUN enregistrement est presque toujours un
+        # changement de format côté fournisseur, jamais un résultat normal.
+        "warning": (
+            "La source n'a produit aucun enregistrement : son format a "
+            "probablement changé. Import à vérifier."
+            if out.get("read", 0) == 0 else None
+        ),
     })
 
 
