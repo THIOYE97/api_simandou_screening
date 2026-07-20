@@ -76,9 +76,18 @@ DEFAULT_SETTINGS: dict = {
     "risk_auto_block_threshold": "HIGH",
 }
 
-SOURCE_NAMES = {1: "Nations Unies (ONU)", 2: "OFAC (US Treasury)", 3: "Union Européenne"}
-SOURCE_CODES = {1: "UN", 2: "OFAC", 3: "EU"}
-SOURCE_FLAGS = {1: "🌐", 2: "🇺🇸", 3: "🇪🇺"}
+# Libellés de repli, utilisés uniquement si la table `sources` est vide.
+# 6 et 7 sont les répertoires de personnes politiquement exposées de Guinée
+# (extraits du Secrétariat Général du Gouvernement).
+SOURCE_NAMES = {
+    1: "Nations Unies (ONU)",
+    2: "OFAC (US Treasury)",
+    3: "Union Européenne",
+    6: "PPE Guinée — Répertoire SGG",
+    7: "PPE Guinée — Membres du Gouvernement (5e République)",
+}
+SOURCE_CODES = {1: "UN", 2: "OFAC", 3: "EU", 6: "GN-PEP-SGG", 7: "GN-PEP-GOV"}
+SOURCE_FLAGS = {1: "🌐", 2: "🇺🇸", 3: "🇪🇺", 6: "🇬🇳", 7: "🇬🇳"}
 
 
 # ─── GET /settings ────────────────────────────────────────────────────────────
@@ -164,14 +173,20 @@ def list_sources(
         if has_sources:
             # Try reading from sources table directly
             try:
+                # NB : les colonnes réelles sont source_code / source_name
+                # (et il n'y a pas de updated_at) — cf. table public.sources.
                 rows = db.execute(
                     text("""
                         SELECT
                             s.id,
-                            COALESCE(s.code::text, s.id::text) AS code,
-                            COALESCE(s.name::text, s.code::text, s.id::text) AS name,
-                            'active' AS status,
-                            s.updated_at AS last_updated,
+                            s.source_code::text AS code,
+                            COALESCE(NULLIF(s.source_name::text, ''), s.source_code::text) AS name,
+                            CASE WHEN s.is_active THEN 'active' ELSE 'inactive' END AS status,
+                            (
+                                SELECT MAX(sr.created_at)
+                                FROM public.source_records sr
+                                WHERE sr.source_id = s.id
+                            ) AS last_updated,
                             (
                                 SELECT COUNT(*)::int
                                 FROM public.source_records sr

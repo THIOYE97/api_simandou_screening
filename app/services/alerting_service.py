@@ -70,8 +70,19 @@ def _assessment_context(a: RiskAssessment) -> dict:
     }
 
 
-def generate_from_assessment(db: Session, assessment: RiskAssessment) -> list[Alert]:
-    """Applique les règles actives (source SCORING) à une évaluation."""
+def generate_from_assessment(
+    db: Session,
+    assessment: RiskAssessment,
+    source: AlertSource = AlertSource.SCORING,
+) -> list[Alert]:
+    """
+    Applique les règles actives à une évaluation.
+
+    `source` qualifie l'ORIGINE métier de l'alerte (SCREENING pour une
+    vérification de personne/fournisseur, KYT pour une opération atypique) afin
+    que la Conformité puisse les distinguer et les filtrer. Le filtrage des
+    RÈGLES reste indépendant : elles sont toutes déclenchées par le scoring.
+    """
     ctx = _assessment_context(assessment)
     rules = db.execute(
         select(AlertRule).where(
@@ -84,7 +95,7 @@ def generate_from_assessment(db: Session, assessment: RiskAssessment) -> list[Al
         if _condition_met(rule.condition or {}, ctx):
             alert = Alert(
                 tenant_id=assessment.tenant_id,
-                source=AlertSource.SCORING,
+                source=source,
                 severity=rule.severity,
                 status=AlertStatus.ESCALATED if rule.auto_escalate else AlertStatus.OPEN,
                 title=rule.name,
@@ -356,6 +367,7 @@ def list_alerts(
     db: Session,
     status: Optional[AlertStatus] = None,
     severity: Optional[AlertSeverity] = None,
+    source: Optional[AlertSource] = None,
     limit: int = 50,
 ) -> list[Alert]:
     stmt = select(Alert).order_by(Alert.created_at.desc()).limit(limit)
@@ -363,6 +375,9 @@ def list_alerts(
         stmt = stmt.where(Alert.status == status)
     if severity:
         stmt = stmt.where(Alert.severity == severity)
+    if source:
+        # SCREENING = vérification client/fournisseur ; KYT = opération atypique.
+        stmt = stmt.where(Alert.source == source)
     return list(db.execute(stmt).scalars().all())
 
 

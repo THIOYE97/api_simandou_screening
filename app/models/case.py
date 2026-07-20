@@ -8,7 +8,7 @@ from app.models.base import Base
 
 class CaseType(str, enum.Enum):
     KYC = "KYC"
-    KYB = "KYB"
+    KYS = "KYS"
 
 
 class CaseStatus(str, enum.Enum):

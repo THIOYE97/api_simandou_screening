@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db_rls as get_db
 from app.api.deps.rbac import require
-from app.models.alerting import AlertSeverity, AlertStatus
+from app.models.alerting import AlertSeverity, AlertSource, AlertStatus
 from app.schemas.alerting import (
     AlertOut,
     AssignUpdate,
@@ -38,10 +38,11 @@ _MANAGE = [Depends(require("alerts:manage"))]
 def list_alerts(
     status: AlertStatus | None = Query(default=None),
     severity: AlertSeverity | None = Query(default=None),
+    source: AlertSource | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     db=Depends(get_db),
 ):
-    return svc.list_alerts(db, status=status, severity=severity, limit=limit)
+    return svc.list_alerts(db, status=status, severity=severity, source=source, limit=limit)
 
 
 @router.patch("/{alert_id}/status", response_model=AlertOut, dependencies=_MANAGE)

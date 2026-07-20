@@ -244,11 +244,11 @@ def build_screening_pdf(db: Session, request_id, tenant_id: Optional[str] = None
     name = (payload.get("override_name")
             or " ".join(x for x in [payload.get("first_name"), payload.get("last_name")] if x).strip()
             or payload.get("company_name") or payload.get("name") or "Client")
-    is_company = bool(payload.get("company_name")) or str(payload.get("entity_type", "")).upper() in ("COMPANY", "KYB")
+    is_company = bool(payload.get("company_name")) or str(payload.get("entity_type", "")).upper() in ("COMPANY", "KYS", "KYB")
     typ = "Entreprise" if is_company else "Personne physique"
 
     st: list[Any] = [_bandeau(S)]
-    st.append(Paragraph("Rapport de vérification de conformité (KYC/KYB)", S["title"]))
+    st.append(Paragraph("Rapport de vérification de conformité (KYC/KYS)", S["title"]))
     st.append(Paragraph("Filtrage contre les listes de sanctions, PEP et adverse media.", S["sub"]))
     st.append(Spacer(1, 10))
     st.append(_meta([("Référence", _ref("VER", rid)), ("Type", typ), ("Émis le", _fmt_date(datetime.now(timezone.utc)))], S))

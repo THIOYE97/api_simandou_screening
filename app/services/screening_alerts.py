@@ -1,5 +1,5 @@
 """
-Passerelle Screening (KYC/KYB) → Alerte.
+Passerelle Screening (KYC/KYS) → Alerte.
 
 Quand un screening produit une correspondance (match) suffisante, on crée une
 évaluation de risque (M7) et on génère une alerte (M6) : le dossier est ainsi
@@ -52,7 +52,7 @@ def raise_alerts_for_screening(
         return []
 
     is_pep = any(str(r["record_type"] or "").upper() == "PEP" for r in rows)
-    subject_type = SubjectType.COMPANY if str(entity_type or "").upper() in ("COMPANY", "KYB") else SubjectType.PERSON
+    subject_type = SubjectType.COMPANY if str(entity_type or "").upper() in ("COMPANY", "KYS", "KYB") else SubjectType.PERSON
 
     context = {"match_score": top_score, "is_pep": is_pep, "match_count": len(rows)}
     assessment = scoring_service.score_subject(
@@ -60,7 +60,9 @@ def raise_alerts_for_screening(
         subject_ref=str(request_id), subject_label=subject_label,
         created_by=created_by, tenant_id=tenant_id, persist=True,
     )
-    alerts = alerting_service.generate_from_assessment(db, assessment)
+    alerts = alerting_service.generate_from_assessment(
+        db, assessment, source=alerting_service.AlertSource.SCREENING
+    )
 
     # Enrichit chaque alerte avec le détail des correspondances (nom, source, motifs).
     def _reasons(val) -> list:

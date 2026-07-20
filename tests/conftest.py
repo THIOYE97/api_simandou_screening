@@ -122,7 +122,7 @@ def migrated_db(database_url):
         # existent déjà. En test, on doit les créer manuellement avant create_all.
         # Si on en ajoute en prod, dupliquer ici.
         enum_definitions = [
-            ("case_type", ["KYC", "KYB"]),
+            ("case_type", ["KYC", "KYS"]),
             ("case_status", ["DRAFT", "PENDING_REVIEW", "ACTION_REQUIRED", "APPROVED", "REJECTED"]),
             ("risk_level", ["LOW", "MEDIUM", "HIGH"]),
             ("entity_type", ["person", "company"]),

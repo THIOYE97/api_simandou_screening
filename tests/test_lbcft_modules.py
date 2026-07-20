@@ -97,7 +97,8 @@ def test_scoring_generates_alerts_and_lifecycle(db):
     open_alerts = alerting_service.list_alerts(db, status=AlertStatus.OPEN)
     if open_alerts:
         closed = alerting_service.transition_status(
-            db, open_alerts[0].id, AlertStatus.CLOSED_FALSE_POSITIVE, resolution="RAS"
+            db, open_alerts[0].id, AlertStatus.CLOSED_FALSE_POSITIVE,
+            resolution="Homonymie confirmée : date de naissance et nationalité différentes.",
         )
         assert closed.status == AlertStatus.CLOSED_FALSE_POSITIVE
         assert closed.resolved_at is not None

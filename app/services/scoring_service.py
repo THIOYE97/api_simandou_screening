@@ -10,6 +10,8 @@ Moteur d'évaluation paramétrable :
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any, Optional
 from uuid import UUID
 
@@ -62,6 +64,73 @@ def _match(criteria: dict, ctx: dict) -> bool:
     return _apply_op(ctx.get(field), op, expected)
 
 
+# --- Résolution des pays -----------------------------------------------------
+# Le référentiel stocke des codes ISO à 2 lettres. Les agents saisissent
+# pourtant souvent l'ISO à 3 lettres (SEN, CIV) ou une abréviation d'usage
+# (RCI, RDC), voire un nom sans accent. Sans tolérance, le pays n'est pas
+# reconnu et le risque géographique est silencieusement ignoré.
+
+_ALPHA3_TO_ALPHA2 = {
+    # Juridictions GAFI
+    "IRN": "IR", "PRK": "KP", "MMR": "MM", "DZA": "DZ", "AGO": "AO", "BGR": "BG",
+    "BFA": "BF", "CMR": "CM", "CIV": "CI", "HRV": "HR", "COD": "CD", "HTI": "HT",
+    "KEN": "KE", "LAO": "LA", "LBN": "LB", "MLI": "ML", "MCO": "MC", "MOZ": "MZ",
+    "NAM": "NA", "NPL": "NP", "NGA": "NG", "ZAF": "ZA", "SSD": "SS", "SYR": "SY",
+    "TZA": "TZ", "VEN": "VE", "VNM": "VN", "YEM": "YE",
+    # Afrique (zone d'activité de la BCRG)
+    "GIN": "GN", "SEN": "SN", "GNB": "GW", "GMB": "GM", "GHA": "GH", "TGO": "TG",
+    "BEN": "BJ", "NER": "NE", "TCD": "TD", "MRT": "MR", "GAB": "GA", "COG": "CG",
+    "CAF": "CF", "GNQ": "GQ", "LBR": "LR", "SLE": "SL", "MAR": "MA", "TUN": "TN",
+    "EGY": "EG", "LBY": "LY", "ETH": "ET", "SDN": "SD", "SOM": "SO", "UGA": "UG",
+    "RWA": "RW", "BDI": "BI", "ZMB": "ZM", "ZWE": "ZW", "BWA": "BW", "MWI": "MW",
+    "MDG": "MG", "MUS": "MU", "CPV": "CV",
+    # Principaux partenaires
+    "FRA": "FR", "USA": "US", "GBR": "GB", "CHN": "CN", "BEL": "BE", "DEU": "DE",
+    "ESP": "ES", "ITA": "IT", "CHE": "CH", "ARE": "AE", "TUR": "TR", "IND": "IN",
+    "CAN": "CA", "LUX": "LU", "NLD": "NL", "PRT": "PT",
+}
+
+_COUNTRY_ALIASES = {
+    "RCI": "CI", "COTE D IVOIRE": "CI", "COTE DIVOIRE": "CI", "IVORY COAST": "CI",
+    "RDC": "CD", "DRC": "CD", "CONGO KINSHASA": "CD", "CONGO RDC": "CD",
+    "GUINEE": "GN", "GUINEE CONAKRY": "GN", "GUINEA": "GN",
+    "ETATS UNIS": "US", "UK": "GB", "ANGLETERRE": "GB", "ROYAUME UNI": "GB",
+    "EAU": "AE", "UAE": "AE", "EMIRATS ARABES UNIS": "AE",
+    "AFRIQUE DU SUD": "ZA", "SOUTH AFRICA": "ZA",
+    "COREE DU NORD": "KP", "NORTH KOREA": "KP", "BIRMANIE": "MM",
+}
+
+
+def _norm_key(value: Any) -> str:
+    """Majuscules, sans accents ni ponctuation (« Côte d'Ivoire » → « COTE D IVOIRE »)."""
+    txt = unicodedata.normalize("NFD", str(value or ""))
+    txt = "".join(c for c in txt if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9]+", " ", txt)).strip().upper()
+
+
+def resolve_country(db: Session, raw: Any) -> Optional[Country]:
+    """Résout un pays depuis un code ISO2/ISO3, un alias d'usage ou un nom."""
+    key = _norm_key(raw)
+    if not key:
+        return None
+
+    code = _COUNTRY_ALIASES.get(key) or _ALPHA3_TO_ALPHA2.get(key)
+    if not code and len(key) in (2, 3):
+        code = key
+    if code:
+        found = db.execute(
+            select(Country).where(func.upper(Country.iso_code) == code)
+        ).scalars().first()
+        if found:
+            return found
+
+    # Repli : comparaison des noms, insensible aux accents et à la ponctuation.
+    for country in db.execute(select(Country)).scalars().all():
+        if _norm_key(country.name) == key:
+            return country
+    return None
+
+
 # --- Enrichissement du contexte ---------------------------------------------
 
 def enrich_context(db: Session, ctx: dict) -> dict:
@@ -70,15 +139,7 @@ def enrich_context(db: Session, ctx: dict) -> dict:
 
     raw = out.get("country")
     if raw:
-        val = str(raw).strip()
-        # Résolution tolérante : par code ISO (ML) OU par nom (Mali, mali)
-        country = db.execute(
-            select(Country).where(func.upper(Country.iso_code) == val.upper())
-        ).scalars().first()
-        if not country:
-            country = db.execute(
-                select(Country).where(func.lower(Country.name) == val.lower())
-            ).scalars().first()
+        country = resolve_country(db, raw)
         if country:
             out.setdefault("country_is_high_risk", country.is_high_risk)
             out.setdefault("country_is_non_cooperative", country.is_non_cooperative)

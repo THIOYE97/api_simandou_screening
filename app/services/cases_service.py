@@ -84,7 +84,7 @@ def create_case(db: Session, case_type: CaseType, created_by: UUID) -> Case:
     """
     Create a case and attach its primary entity:
       - KYC -> PRIMARY_PERSON
-      - KYB -> PRIMARY_COMPANY
+      - KYS -> PRIMARY_COMPANY
 
     IMPORTANT: cases.created_by is NOT NULL in DB, so created_by must be provided.
     Also: cases is tenant-scoped => we set tenant_id best-effort for RLS.
@@ -130,7 +130,7 @@ def create_case(db: Session, case_type: CaseType, created_by: UUID) -> Case:
                     {"case_id": str(case.id), "entity_id": str(entity_id)},
                 )
 
-        elif case_type == CaseType.KYB:
+        elif case_type == CaseType.KYS:
             entity_id = _create_entity(db, ENTITY_TYPE_COMPANY, "")
             db.add(Company(entity_id=entity_id))
 
@@ -244,7 +244,7 @@ def upsert_company_for_case(db: Session, case_id: UUID, data: dict) -> Company:
     ).mappings().first()
 
     if not primary:
-        raise ValueError("Case is not KYB or missing PRIMARY_COMPANY")
+        raise ValueError("Case is not KYS or missing PRIMARY_COMPANY")
 
     entity_id = primary["entity_id"]
 
@@ -282,7 +282,7 @@ def add_company_person(
 ) -> CompanyPerson:
     tenant_id = _require_tenant_uuid(db)
 
-    # ensure case is KYB
+    # ensure case is KYS
     primary = db.execute(
         text(
             """
@@ -296,7 +296,7 @@ def add_company_person(
     ).mappings().first()
 
     if not primary:
-        raise ValueError("Case is not KYB or missing PRIMARY_COMPANY")
+        raise ValueError("Case is not KYS or missing PRIMARY_COMPANY")
 
     company = db.query(Company).filter(Company.entity_id == primary["entity_id"]).one()
 
