@@ -395,16 +395,28 @@ def screening_from_document(
             extra={"subject_name": name, "case_id": case_id, "doc_id": str(doc.id), "tenant_id": tenant_id},
         )
 
+        # Nationalité lue sur la pièce d'identité : elle alimente la synthèse de
+        # la vérification et, à défaut de pays fourni, oriente le filtrage.
+        fields = doc.extracted_fields or {}
+        nationality = (
+            (fields.get("nationality") or "").strip()
+            or (fields.get("issuing_country") or "").strip()
+            or None
+        )
+
         out = run_simple_screening(
             db=db,
             name=name,
             client_id=payload.client_id,
-            country_focus=payload.country_focus,
+            country_focus=payload.country_focus or nationality,
             meta={
                 "trigger":     "screening.from_document",
                 "document_id": str(doc.id),
                 "case_id":     case_id,
                 "created_by":  created_by,
+                "entity_type": "INDIVIDUAL",
+                "nationality": nationality,
+                "dob":         (fields.get("date_of_birth") or None),
             },
         )
         return ScreeningCheckOut(**out)

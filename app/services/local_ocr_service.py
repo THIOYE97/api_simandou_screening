@@ -70,6 +70,8 @@ JSON schema (all fields optional, omit if not found):
   "full_name":       "FIRST LAST combined",
   "date_of_birth":   "YYYY-MM-DD",
   "document_number": "Alphanumeric ID number",
+  "nationality":     "Nationality EXACTLY as printed (often an ISO 3-letter code such as GIN, FRA)",
+  "issuing_country": "Country that issued the document (code or name as printed)",
   "mrz":             "Full MRZ line(s) if visible",
   "confidence":      0.0 to 1.0
 }
@@ -78,6 +80,9 @@ Rules:
 - Extract exactly what is printed, do NOT infer.
 - Dates must be ISO format YYYY-MM-DD.
 - Names must be uppercase.
+- nationality: on a passport, it is the "Nationality / Nationalité" field; it is
+  also the 3-letter code in positions 11-13 of MRZ line 2. Prefer the printed
+  field; fall back to the MRZ code. Omit the key if genuinely absent.
 - confidence: 0.9+ if clear, 0.5-0.8 if partial, <0.5 if poor quality.
 - If nothing readable: {"confidence": 0.0}
 """

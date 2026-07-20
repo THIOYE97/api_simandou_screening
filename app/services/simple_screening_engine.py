@@ -90,6 +90,15 @@ def _current_tenant_uuid(db: Session) -> Optional[UUID_T]:
         return None
 
 
+# Attributs métier recopiés à la racine du request_payload (cf. plus bas) :
+# ce sont ceux que les écrans et rapports consultent directement.
+_PROMOTED_META_KEYS = (
+    "entity_type", "nationality", "country", "dob", "company_name",
+    "first_name", "last_name", "registration_number", "incorporation_country",
+    "document_id",
+)
+
+
 def _require_tenant_uuid(db: Session) -> UUID_T:
     tid = _current_tenant_uuid(db)
     if not tid:
@@ -254,15 +263,26 @@ def run_simple_screening(
         }
 
     # 1) request
+    # Les attributs métier sont recopiés À LA RACINE du payload : les lecteurs
+    # (détail d'une vérification, rapport PDF, liste, export CSV) les y
+    # cherchent naturellement. Les laisser uniquement sous `meta` a déjà causé
+    # plusieurs affichages vides ou erronés. `meta` est conservé tel quel pour
+    # la compatibilité des demandes existantes.
+    _payload = {
+        "name": name,
+        "name_normalized": input_norm,
+        "country_focus": country_focus,
+        "meta": meta or {},
+    }
+    for _k in _PROMOTED_META_KEYS:
+        _v = (meta or {}).get(_k)
+        if _v not in (None, "", [], {}):
+            _payload.setdefault(_k, _v)
+
     req = ScreeningRequest(
         id=uuid.uuid4(),
         client_id=client_id,
-        request_payload={
-            "name": name,
-            "name_normalized": input_norm,
-            "country_focus": country_focus,
-            "meta": meta or {},
-        },
+        request_payload=_payload,
     )
     _set_if_attr(req, "tenant_id", tenant_id)
     _set_if_attr(req, "case_id", case_uuid)
