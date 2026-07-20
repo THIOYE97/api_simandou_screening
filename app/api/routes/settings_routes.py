@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -586,3 +586,71 @@ def list_importable_sources(user=Depends(get_current_user)):
         {"code": c, "label": a.get("label"), "url": a.get("url")}
         for c, a in sorted(list_adapters.ADAPTERS.items())
     ])
+
+
+@router.post("/settings/sources/{code}/import-file")
+async def import_source_file(
+    code: str,
+    file: UploadFile = File(...),
+    max_records: int = 5000,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Importe une liste à partir d'un fichier DÉPOSÉ.
+
+    Certaines administrations refusent les téléchargements venant d'un serveur
+    (connexion acceptée puis maintenue sans réponse) : le fichier n'est alors
+    accessible que depuis un navigateur. La Conformité le télécharge elle-même
+    et le dépose ici. Même analyseur, même idempotence que l'import automatique.
+    """
+    import os
+    import tempfile
+
+    from app.services import list_adapters, list_ingest
+
+    _setup(db, user)
+    adapter = list_adapters.ADAPTERS.get(code.upper())
+    if not adapter or not adapter.get("parse"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Aucun analyseur de fichier pour « {code} ».",
+        )
+
+    fd, path = tempfile.mkstemp(prefix="upload_")
+    os.close(fd)
+    try:
+        with open(path, "wb") as out:
+            while chunk := await file.read(1 << 20):
+                out.write(chunk)
+        if os.path.getsize(path) < 1024:
+            raise HTTPException(status_code=400, detail="Fichier vide ou tronqué.")
+
+        out = list_ingest.ingest(
+            db,
+            source_code=code.upper(),
+            source_name=adapter["name"],
+            records=adapter["parse"](path),
+            record_type=adapter.get("record_type", "SANCTION"),
+            evidence_url=adapter.get("url"),
+            max_records=max_records,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("list_import_file_failed")
+        raise HTTPException(status_code=400, detail=f"Import impossible : {e}")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    return JSONResponse(content={
+        "source": code.upper(),
+        "filename": file.filename,
+        "created": out["created"],
+        "skipped": out["skipped"],
+        "read": out.get("read", 0),
+        "remaining": out.get("remaining", False),
+    })

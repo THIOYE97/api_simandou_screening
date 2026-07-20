@@ -378,10 +378,27 @@ _DFAT_REF = re.compile(r"^(\d+)")
 
 
 def fetch_dfat_sanctions(url: str = DFAT_URL) -> Iterator[dict]:
-    """Télécharge et regroupe la Consolidated List australienne."""
+    """Télécharge puis analyse la Consolidated List australienne."""
+    path = _download_to_file(url)
+    try:
+        yield from parse_dfat_sanctions(path)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def parse_dfat_sanctions(path: str) -> Iterator[dict]:
+    """
+    Analyse un classeur DFAT DÉJÀ présent sur le disque.
+
+    Séparé du téléchargement car le portail australien refuse les requêtes
+    venant d'un serveur (connexion acceptée puis maintenue sans réponse). La
+    Conformité dépose alors le classeur obtenu depuis son navigateur.
+    """
     import openpyxl
 
-    path = _download_to_file(url)
     grouped: dict[str, dict] = {}
     try:
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -441,11 +458,8 @@ def fetch_dfat_sanctions(url: str = DFAT_URL) -> Iterator[dict]:
             elif name != entry["primary_name"]:
                 entry["aliases"].append(name)
         wb.close()
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    except StopIteration:
+        raise RuntimeError("Classeur DFAT vide : aucune ligne d'en-tête.")
 
     for entry in grouped.values():
         if not entry["primary_name"]:
@@ -484,6 +498,9 @@ ADAPTERS: dict[str, dict] = {
     DFAT_SOURCE_CODE: {
         "name": DFAT_SOURCE_NAME,
         "fetch": fetch_dfat_sanctions,
+        "parse": parse_dfat_sanctions,
+        "upload_only": True,   # le portail refuse les requêtes serveur
+        "file_hint": "Classeur Australian_Sanctions_Consolidated_List.xlsx",
         "record_type": "SANCTION",
         "url": DFAT_URL,
         "label": "Australie — DFAT, Consolidated List",
