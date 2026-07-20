@@ -18,6 +18,7 @@ class AlertSource(str, enum.Enum):
     SCREENING = "SCREENING"
     SCORING = "SCORING"
     KYT = "KYT"
+    UBO = "UBO"            # bénéficiaire effectif
     MANUAL = "MANUAL"
 
 

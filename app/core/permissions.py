@@ -29,6 +29,8 @@ PERMISSIONS: dict[str, str] = {
     "sar:read": "Consulter les déclarations de soupçon",
     "sar:manage": "Créer / traiter les déclarations de soupçon",
     # M6 Alerte
+    "ubo:read": "Consulter les bénéficiaires effectifs",
+    "ubo:write": "Déclarer et filtrer les bénéficiaires effectifs",
     "alerts:read": "Consulter les alertes",
     "alerts:manage": "Traiter, affecter, clôturer les alertes + règles",
     # M7 Scoring
@@ -58,7 +60,7 @@ DEFAULT_ROLES: dict[str, dict] = {
         "name": "Responsable Conformité",
         "description": "Cellule de Conformité : alertes, soupçons, reporting.",
         "permissions": [
-            "referentiel:read", "screening:read", "kyt:read",
+            "referentiel:read", "screening:read", "kyt:read", "ubo:read", "ubo:write",
             "alerts:read", "alerts:manage", "sar:read", "sar:manage",
             "scoring:read", "reports:read", "audit:read",
         ],
@@ -68,7 +70,7 @@ DEFAULT_ROLES: dict[str, dict] = {
         "description": "Analyse opérationnelle : screening, KYT, alertes.",
         "permissions": [
             "referentiel:read", "screening:run", "screening:read",
-            "kyt:ingest", "kyt:read", "scoring:evaluate", "scoring:read",
+            "kyt:ingest", "kyt:read", "scoring:evaluate", "scoring:read", "ubo:read", "ubo:write",
             "alerts:read", "sar:read", "reports:read",
         ],
     },
@@ -84,7 +86,7 @@ DEFAULT_ROLES: dict[str, dict] = {
         "name": "Auditeur",
         "description": "Consultation en lecture seule + piste d'audit.",
         "permissions": [
-            "referentiel:read", "screening:read", "kyt:read", "alerts:read",
+            "referentiel:read", "screening:read", "kyt:read", "ubo:read", "ubo:write", "alerts:read",
             "sar:read", "scoring:read", "reports:read", "audit:read", "lists:read",
         ],
     },

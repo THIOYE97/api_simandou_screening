@@ -24,7 +24,7 @@ def test_seed_referentiel(db):
     from app.services import referentiel_service
     created = referentiel_service.seed_referentiel(db)
     assert created["countries"] > 0
-    assert created["scenarios"] == 7
+    assert created["scenarios"] == 9   # dont 2 scénarios bénéficiaires effectifs
 
     countries = referentiel_service.list_countries(db)
     iso = {c.iso_code for c in countries}
@@ -368,3 +368,61 @@ def test_t24_mapping(db):
     assert data["currency"] == "EUR"
     assert data["counterparty_country"] == "IR"
     assert data["source_system"].value == "T24"
+
+
+@pytest.mark.integration
+def test_ubo_effective_ownership_through_chain(db):
+    """
+    Une chaîne de détention doit être aplatie par PRODUIT des pourcentages.
+
+    Détenir 80 % d'une holding qui détient 60 % de la cible = 48 % effectifs :
+    au-dessus du seuil de 25 %, donc bénéficiaire effectif — alors qu'un simple
+    regard niveau par niveau ne le montrerait pas. C'est précisément le montage
+    utilisé pour diluer une détention apparente.
+    """
+    from app.models.ubo import PartyKind
+    from app.services import ubo_service
+
+    decl = ubo_service.create_declaration(db, {
+        "company_name": "Simandou Mining SA",
+        "company_ref": "RCCM-GN-2026-B-001",
+        "company_country": "GN",
+    })
+
+    holding = ubo_service.add_member(db, decl.id, {
+        "full_name": "Guinea Holding Ltd", "kind": PartyKind.ENTITY,
+        "ownership_percent": 60,
+    })
+    owner = ubo_service.add_member(db, decl.id, {
+        "full_name": "Mamadou Diallo", "kind": PartyKind.PERSON,
+        "parent_id": holding.id, "ownership_percent": 80,
+    })
+    petit = ubo_service.add_member(db, decl.id, {
+        "full_name": "Aissatou Bah", "kind": PartyKind.PERSON,
+        "parent_id": holding.id, "ownership_percent": 20,
+    })
+
+    out_owner = ubo_service.member_out(db, owner)
+    out_petit = ubo_service.member_out(db, petit)
+
+    # 80 % de 60 % = 48 % -> bénéficiaire effectif
+    assert out_owner["effective_percent"] == pytest.approx(48.0)
+    assert out_owner["is_beneficial_owner"] is True
+
+    # 20 % de 60 % = 12 % -> sous le seuil, pas bénéficiaire effectif
+    assert out_petit["effective_percent"] == pytest.approx(12.0)
+    assert out_petit["is_beneficial_owner"] is False
+
+
+@pytest.mark.integration
+def test_ubo_legal_representative_is_always_beneficial_owner(db):
+    """Le dirigeant est bénéficiaire effectif même sans détention de capital."""
+    from app.models.ubo import PartyKind
+    from app.services import ubo_service
+
+    decl = ubo_service.create_declaration(db, {"company_name": "Conakry Trading SARL"})
+    gerant = ubo_service.add_member(db, decl.id, {
+        "full_name": "Ibrahima Sow", "kind": PartyKind.PERSON,
+        "ownership_percent": 0, "control_nature": "LEGAL_REPRESENTATIVE",
+    })
+    assert ubo_service.member_out(db, gerant)["is_beneficial_owner"] is True
