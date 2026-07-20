@@ -656,6 +656,13 @@ def list_screenings(
             LEFT JOIN public.cases c
                 ON c.id = sr.case_id
             WHERE 1 = 1
+              -- Exclut les filtrages de contreparties déclenchés par une
+              -- opération (KYT) : ils appartiennent au dossier de l'opération,
+              -- qui figure déjà dans la liste. Les faire apparaître comme des
+              -- vérifications de personnes polluerait la liste et mélangerait
+              -- deux natures de contrôle. Ils restent consultables depuis
+              -- l'opération et conservés pour l'audit.
+              AND COALESCE(sr.request_payload->'meta'->>'trigger', '') <> 'kyt.party_screening'
     """
 
     if status_norm:
