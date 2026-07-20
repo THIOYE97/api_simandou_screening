@@ -780,13 +780,23 @@ def list_screenings(
             or None
         )
 
+        # Le moteur range les attributs de la demande sous `meta` : sans le lire,
+        # une société ressortait comme une personne physique.
+        p_meta = payload.get("meta") if isinstance(payload, dict) else None
+        p_meta = p_meta if isinstance(p_meta, dict) else {}
+        entity_type = (
+            _safe_str(payload.get("entity_type"))
+            or _safe_str(p_meta.get("entity_type"))
+            or ("COMPANY" if payload.get("company_name") or p_meta.get("company_name") else None)
+        )
         item_kind = (
             _safe_str(payload.get("kind"))
             or _safe_str(payload.get("trigger"))
-            or None
+            or (str(entity_type).upper() if entity_type else None)
         )
 
         items.append({
+            "entity_type": (str(entity_type).upper() if entity_type else None),
             "id": row.get("id"),
             "provider": row.get("provider") or "INTERNAL",
             "status": row.get("status"),
@@ -1063,10 +1073,18 @@ def export_screenings_csv(
                 or ""
             )
 
+            # Idem liste : le type d'entité se trouve sous `meta`.
+            c_meta = payload.get("meta") if isinstance(payload, dict) else None
+            c_meta = c_meta if isinstance(c_meta, dict) else {}
+            c_entity = (
+                _safe_str(payload.get("entity_type"))
+                or _safe_str(c_meta.get("entity_type"))
+                or ("COMPANY" if payload.get("company_name") or c_meta.get("company_name") else "")
+            )
             item_kind = (
                 _safe_str(payload.get("kind"))
                 or _safe_str(payload.get("trigger"))
-                or ""
+                or (str(c_entity).upper() if c_entity else "")
             )
 
             writer.writerow([
