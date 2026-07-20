@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any, Optional
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.alerting import AlertSource
@@ -28,6 +28,16 @@ from app.services import alerting_service, list_screening, scoring_service
 # Seuil légal usuel de détention à partir duquel une personne est bénéficiaire
 # effectif (directive LBC/FT et Acte uniforme OHADA sur les sociétés).
 OWNERSHIP_THRESHOLD = Decimal("25")
+
+
+def _norm(value: str) -> str:
+    """Dénomination comparable : sans accents, ponctuation ni forme juridique."""
+    import re
+    import unicodedata
+    txt = unicodedata.normalize("NFD", str(value or ""))
+    txt = "".join(c for c in txt if unicodedata.category(c) != "Mn")
+    txt = re.sub(r"[^A-Za-z0-9]+", " ", txt).strip().upper()
+    return re.sub(r"\s+", " ", txt)
 
 
 # --- Déclarations ------------------------------------------------------------
@@ -48,6 +58,31 @@ def get_members(db: Session, declaration_id: UUID) -> list[UboMember]:
         .where(UboMember.declaration_id == declaration_id)
         .order_by(UboMember.created_at)
     ).scalars().all())
+
+
+def find_declaration_for_company(
+    db: Session, company_name: Optional[str] = None, company_ref: Optional[str] = None,
+) -> Optional[UboDeclaration]:
+    """
+    Rapproche une société de sa déclaration de bénéficiaires effectifs.
+
+    L'identifiant (RCCM/NIF) prime sur la dénomination, qui varie dans son
+    écriture (« SA », « S.A. », casse, accents).
+    """
+    if company_ref:
+        found = db.execute(
+            select(UboDeclaration).where(
+                func.upper(UboDeclaration.company_ref) == company_ref.strip().upper()
+            )
+        ).scalars().first()
+        if found:
+            return found
+    if company_name:
+        key = _norm(company_name)
+        for d in db.execute(select(UboDeclaration)).scalars().all():
+            if _norm(d.company_name) == key:
+                return d
+    return None
 
 
 def create_declaration(

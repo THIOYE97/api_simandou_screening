@@ -72,6 +72,35 @@ def create_declaration(payload: DeclarationIn, db=Depends(get_db), user=Depends(
     return _decl_out(db, decl)
 
 
+# NB : déclarée AVANT /declarations/{declaration_id}, sinon « lookup » serait
+# interprété comme un identifiant et rejeté.
+@router.get("/declarations/lookup")
+def lookup_declaration(
+    company_name: Optional[str] = Query(default=None),
+    company_ref: Optional[str] = Query(default=None),
+    db=Depends(get_db),
+):
+    """
+    Rapproche une société de sa déclaration de bénéficiaires effectifs.
+
+    Retourne `{"found": false}` plutôt qu'un 404 : l'absence de déclaration est
+    une réponse métier normale — et c'est précisément ce qui rend une
+    vérification de personne morale incomplète au regard des obligations LBC/FT.
+    """
+    decl = svc.find_declaration_for_company(db, company_name=company_name, company_ref=company_ref)
+    if not decl:
+        return {"found": False, "declaration": None}
+    out = _decl_out(db, decl)
+    owners = [m for m in out["members"] if m["is_beneficial_owner"]]
+    return {
+        "found": True,
+        "declaration": out,
+        "owners_count": len(owners),
+        "flagged_count": len([m for m in owners if (m.get("matches") or [])]),
+        "last_screened_at": out["last_screened_at"],
+    }
+
+
 @router.get("/declarations/{declaration_id}")
 def get_declaration(declaration_id: UUID, db=Depends(get_db)):
     decl = svc.get_declaration(db, declaration_id)
