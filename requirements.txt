@@ -104,3 +104,4 @@ wcwidth==0.6.0
 webencodings==0.5.1
 websockets==16.0
 yarg==0.1.9
+openpyxl==3.1.5

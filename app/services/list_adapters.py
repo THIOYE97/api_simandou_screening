@@ -340,6 +340,92 @@ def fetch_seco_sanctions(url: str = SECO_URL) -> Iterator[dict]:
 
 
 # --------------------------------------------------------------------------
+# Australie — DFAT, Consolidated List
+# --------------------------------------------------------------------------
+# Classeur Excel (1,3 Mo), établi sur le fichier réel : 11 046 lignes pour
+# 3 838 désignations.
+#
+# La clé de regroupement est le PRÉFIXE NUMÉRIQUE de la référence : « 3080 »
+# porte le nom principal, « 3080a » … « 3080ae » ses 32 alias. Sans ce
+# regroupement, chaque alias serait importé comme une entité distincte —
+# 11 046 entités au lieu de 3 838, et autant de faux positifs autonomes.
+# Contrôle de cohérence : le nombre de lignes « Primary Name » (3 838) est
+# exactement égal au nombre de références de base.
+DFAT_URL = "https://www.dfat.gov.au/sites/default/files/Australian_Sanctions_Consolidated_List.xlsx"
+DFAT_SOURCE_CODE = "DFAT"
+DFAT_SOURCE_NAME = "Sanctions — Australie (DFAT)"
+
+_DFAT_REF = re.compile(r"^(\d+)")
+
+
+def fetch_dfat_sanctions(url: str = DFAT_URL) -> Iterator[dict]:
+    """Télécharge et regroupe la Consolidated List australienne."""
+    import openpyxl
+
+    path = _download_to_file(url)
+    grouped: dict[str, dict] = {}
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        rows = ws.iter_rows(values_only=True)
+        header = [str(h or "").strip() for h in next(rows)]
+
+        def cell(row, key: str) -> str:
+            try:
+                v = row[header.index(key)]
+            except (ValueError, IndexError):
+                return ""
+            return str(v).strip() if v is not None else ""
+
+        for row in rows:
+            ref = cell(row, "Reference")
+            name = cell(row, "Name of Individual or Entity")
+            if not ref or not name:
+                continue
+            m = _DFAT_REF.match(ref)
+            base = m.group(1) if m else ref
+
+            kind = cell(row, "Type").lower()
+            etype = "person" if kind == "individual" else "company"
+            is_primary = cell(row, "Name Type").lower() == "primary name"
+
+            entry = grouped.setdefault(base, {
+                "source_ref": base,
+                "entity_type": etype,
+                "primary_name": "",
+                "aliases": [],
+                "_seen": {},
+                "program": cell(row, "Committees") or None,
+                "listed_on": None,
+                "country": cell(row, "Citizenship")[:64] or None,
+                "summary": cell(row, "Listing Information")[:2000] or None,
+                "raw": {"reference": base, "type": cell(row, "Type"),
+                        "dob": cell(row, "Date of Birth")[:120]},
+            })
+            if name in entry["_seen"]:
+                continue
+            entry["_seen"][name] = True
+            if is_primary and not entry["primary_name"]:
+                entry["primary_name"] = name
+            elif name != entry["primary_name"]:
+                entry["aliases"].append(name)
+        wb.close()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    for entry in grouped.values():
+        if not entry["primary_name"]:
+            if not entry["aliases"]:
+                continue
+            entry["primary_name"] = entry["aliases"].pop(0)
+        entry.pop("_seen", None)
+        yield entry
+
+
+# --------------------------------------------------------------------------
 # Registre des adaptateurs
 # --------------------------------------------------------------------------
 ADAPTERS: dict[str, dict] = {
@@ -363,5 +449,12 @@ ADAPTERS: dict[str, dict] = {
         "record_type": "SANCTION",
         "url": SECO_URL,
         "label": "Suisse — SECO, liste consolidée",
+    },
+    DFAT_SOURCE_CODE: {
+        "name": DFAT_SOURCE_NAME,
+        "fetch": fetch_dfat_sanctions,
+        "record_type": "SANCTION",
+        "url": DFAT_URL,
+        "label": "Australie — DFAT, Consolidated List",
     },
 }
