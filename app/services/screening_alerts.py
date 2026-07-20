@@ -33,11 +33,13 @@ def raise_alerts_for_screening(
     rows = db.execute(
         text("""
             SELECT sm.match_score, sm.match_band, sm.reasons,
-                   e.primary_name AS entity_name, e.source_name,
+                   e.primary_name AS entity_name,
+                   COALESCE(s.source_name, e.source_name) AS source_name,
                    sr.program, sr.record_type
             FROM screening_matches sm
             LEFT JOIN entities e ON e.id = sm.entity_id
             LEFT JOIN source_records sr ON sr.id = sm.source_record_id
+            LEFT JOIN sources s ON s.id = sr.source_id
             WHERE sm.request_id = CAST(:rid AS uuid)
             ORDER BY sm.match_score DESC
             LIMIT 20
