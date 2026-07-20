@@ -32,7 +32,7 @@ def upgrade() -> None:
          WHERE a.source = 'SCORING'::alert_source
            AND a.risk_assessment_id IS NOT NULL
            AND EXISTS (
-               SELECT 1 FROM transactions t
+               SELECT 1 FROM kyt_transactions t
                 WHERE t.risk_assessment_id = a.risk_assessment_id
            )
     """)
