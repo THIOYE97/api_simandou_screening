@@ -244,8 +244,13 @@ def build_screening_pdf(db: Session, request_id, tenant_id: Optional[str] = None
     name = (payload.get("override_name")
             or " ".join(x for x in [payload.get("first_name"), payload.get("last_name")] if x).strip()
             or payload.get("company_name") or payload.get("name") or "Client")
-    is_company = bool(payload.get("company_name")) or str(payload.get("entity_type", "")).upper() in ("COMPANY", "KYS", "KYB")
-    typ = "Entreprise" if is_company else "Personne physique"
+    # Le moteur range les attributs de la demande sous `meta` : sans le lire, une
+    # société ressortait en « Personne physique » et la nationalité restait vide.
+    meta = payload.get("meta") or {}
+    etype = str(payload.get("entity_type") or meta.get("entity_type") or "").upper()
+    is_company = bool(payload.get("company_name") or meta.get("company_name")) \
+        or etype in ("COMPANY", "KYS", "KYB")
+    typ = "Personne morale" if is_company else "Personne physique"
 
     st: list[Any] = [_bandeau(S)]
     st.append(Paragraph("Rapport de vérification de conformité (KYC/KYS)", S["title"]))
@@ -261,7 +266,10 @@ def build_screening_pdf(db: Session, request_id, tenant_id: Optional[str] = None
     st.append(_kv([
         ("Nom / dénomination", name),
         ("Type", typ),
-        ("Nationalité / pays", payload.get("nationality") or payload.get("country") or "—"),
+        ("Nationalité / pays",
+         payload.get("nationality") or payload.get("country")
+         or meta.get("nationality") or meta.get("country")
+         or meta.get("incorporation_country") or payload.get("country_focus") or "—"),
         ("Date de la vérification", _fmt_date((req or {}).get("created_at"))),
         ("Correspondances trouvées", str(len(matches))),
     ], S))
