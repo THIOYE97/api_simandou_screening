@@ -82,6 +82,11 @@ def _screen_party(
             db=db, name=name.strip(), country_focus=country,
             meta={"trigger": "kyt.party_screening", "role": role},
         )
+        # Le moteur committe : le contexte est de nouveau perdu. Sans le
+        # rétablir, la relecture de screening_matches (protégée par la RLS)
+        # renverrait zéro ligne SANS erreur — panne silencieuse.
+        if tenant_id:
+            set_tenant_context(db, str(tenant_id))
         rows = db.execute(_PARTY_MATCH_SQL, {"rid": str(res["request_id"])}).mappings().all()
     except Exception:
         # Le filtrage ne doit jamais empêcher l'ingestion d'une opération.
