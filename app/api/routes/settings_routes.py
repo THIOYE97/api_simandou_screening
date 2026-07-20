@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,6 +17,7 @@ from app.api.deps.db import get_db_rls as get_db
 from app.core.db import set_tenant_context
 
 router = APIRouter(tags=["settings"])
+logger = logging.getLogger("simandou.settings")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -516,3 +518,60 @@ def update_user_role(
         except Exception:
             pass
         raise HTTPException(500, f"Erreur mise à jour rôle: {e}")
+
+
+# ─── POST /settings/sources/{code}/import ────────────────────────────────────
+
+@router.post("/settings/sources/{code}/import")
+def import_source(
+    code: str,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Télécharge la liste officielle et l'ingère.
+
+    L'import se fait CÔTÉ SERVEUR : la Conformité met ses listes à jour depuis
+    l'application, sans accès à la base ni intervention technique.
+    Idempotent : relancer n'ajoute que les désignations nouvelles.
+    """
+    from app.services import list_adapters, list_ingest
+
+    _setup(db, user)
+    adapter = list_adapters.ADAPTERS.get(code.upper())
+    if not adapter:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Aucun import automatique pour « {code} ». Sources disponibles : "
+                   + ", ".join(sorted(list_adapters.ADAPTERS)),
+        )
+    try:
+        records = adapter["fetch"]()
+        out = list_ingest.ingest(
+            db,
+            source_code=code.upper(),
+            source_name=adapter["name"],
+            records=records,
+            record_type=adapter.get("record_type", "SANCTION"),
+            evidence_url=adapter.get("url"),
+        )
+    except Exception as e:
+        logger.exception("list_import_failed")
+        raise HTTPException(status_code=502, detail=f"Import impossible : {e}")
+
+    return JSONResponse(content={
+        "source": code.upper(),
+        "label": adapter.get("label"),
+        "created": out["created"],
+        "skipped": out["skipped"],
+    })
+
+
+@router.get("/settings/sources/importable")
+def list_importable_sources(user=Depends(get_current_user)):
+    """Sources dont la mise à jour peut être déclenchée depuis l'application."""
+    from app.services import list_adapters
+    return JSONResponse(content=[
+        {"code": c, "label": a.get("label"), "url": a.get("url")}
+        for c, a in sorted(list_adapters.ADAPTERS.items())
+    ])
