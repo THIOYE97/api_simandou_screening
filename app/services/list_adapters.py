@@ -213,6 +213,133 @@ def fetch_canada_sanctions(url: str = CANADA_URL) -> Iterator[dict]:
 
 
 # --------------------------------------------------------------------------
+# Suisse — SECO, liste consolidée
+# --------------------------------------------------------------------------
+# Structure établie sur le fichier réel (40 Mo, 8 604 cibles) :
+#   <target ssid> -> <individual|entity|object> -> <identity> -> <name>
+#   <name name-type="primary-name|alias|formerly-known-as">
+#       <name-part order name-part-type="family-name|given-name|whole-name|...">
+#           <value>…</value><spelling-variant>…</spelling-variant>
+#
+# Points d'attention :
+#   - le nom se RECOMPOSE en ordonnant les <name-part> par `order` ; la partie
+#     « title » est écartée (« Mr », « Général »… ne sont pas des noms) ;
+#   - les mêmes noms sont répétés dans plusieurs LANGUES : sans dédoublonnage,
+#     chaque cible héritait d'alias redondants ;
+#   - les variantes orthographiques (y compris en cyrillique) sont de vrais
+#     alias : les conserver améliore le rapprochement ;
+#   - le programme se résout via <sanctions-set-id> ; les 65 programmes sont
+#     déclarés AVANT les cibles, ce qui permet une lecture en un seul passage.
+SECO_URL = ("https://www.sesam.search.admin.ch/sesam-search-web/pages/"
+            "downloadXmlGesamtliste.xhtml?lang=en&action=downloadXmlGesamtlisteAction")
+SECO_SOURCE_CODE = "SECO"
+SECO_SOURCE_NAME = "Sanctions — Suisse (SECO)"
+
+_SECO_SKIP_PARTS = {"title", "suffix"}
+
+
+def _seco_names(node) -> list[tuple[bool, str]]:
+    """Retourne [(est_principal, nom)] pour une cible, variantes comprises."""
+    out: list[tuple[bool, str]] = []
+    for name in node.iter("name"):
+        parts = []
+        variants: list[str] = []
+        for part in name.findall("name-part"):
+            if (part.get("name-part-type") or "") in _SECO_SKIP_PARTS:
+                continue
+            value = (part.findtext("value") or "").strip()
+            if value:
+                try:
+                    order = int(part.get("order") or 0)
+                except ValueError:
+                    order = 0
+                parts.append((order, value))
+            variants.extend(
+                v.text.strip() for v in part.findall("spelling-variant") if v.text and v.text.strip()
+            )
+        full = " ".join(v for _, v in sorted(parts, key=lambda x: x[0]))
+        is_primary = (name.get("name-type") or "") == "primary-name"
+        if full:
+            out.append((is_primary, full))
+        out.extend((False, v) for v in variants)
+    return out
+
+
+def fetch_seco_sanctions(url: str = SECO_URL) -> Iterator[dict]:
+    """Télécharge et analyse la liste consolidée suisse."""
+    path = _download_to_file(url)
+    programs: dict[str, str] = {}
+    depth = 0
+    try:
+        # ATTENTION : le document contient 8 470 <target> IMBRIQUÉS dans
+        # l'historique (<modification><added|removed>), dont 1 698 sous
+        # « removed » — c'est-à-dire des personnes RETIRÉES de la liste.
+        # Les ingérer reviendrait à signaler comme sanctionnées des personnes
+        # délistées. Seules les cibles de premier niveau (enfants directs de la
+        # racine, donc profondeur 2) sont des désignations en vigueur.
+        for event, el in ET.iterparse(path, events=("start", "end")):
+            if event == "start":
+                depth += 1
+                continue
+            el_depth, depth = depth, depth - 1
+
+            if el.tag == "target" and el_depth != 2:
+                continue                      # historique : on ignore
+            if el.tag == "sanctions-program":
+                names = [p for p in el.findall("program-name") if p.get("lang") == "fre"] \
+                    or el.findall("program-name")
+                label = (names[0].text or "").strip() if names else ""
+                for s in el.findall("sanctions-set"):
+                    programs[s.get("ssid") or ""] = label
+                el.clear()
+                continue
+            if el.tag != "target":
+                continue
+
+            kind_node = next((el.find(k) for k in ("individual", "entity", "object")
+                              if el.find(k) is not None), None)
+            if kind_node is None:
+                el.clear()
+                continue
+            etype = "person" if kind_node.tag == "individual" else "company"
+
+            primary = ""
+            aliases: list[str] = []
+            seen: dict[str, bool] = {}
+            for is_primary, value in _seco_names(kind_node):
+                if value in seen:                 # même nom répété d'une langue à l'autre
+                    continue
+                seen[value] = True
+                if is_primary and not primary:
+                    primary = value
+                else:
+                    aliases.append(value)
+            if not primary:
+                if not aliases:
+                    el.clear()
+                    continue
+                primary = aliases.pop(0)
+
+            yield {
+                "source_ref": el.get("ssid") or "",
+                "entity_type": etype,
+                "primary_name": primary,
+                "aliases": aliases,
+                "program": programs.get((el.findtext("sanctions-set-id") or "").strip()) or None,
+                "listed_on": None,
+                "country": None,
+                "summary": (kind_node.findtext("justification") or "").strip()[:2000] or None,
+                "raw": {"ssid": el.get("ssid"), "kind": kind_node.tag},
+            }
+            el.clear()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
 # Registre des adaptateurs
 # --------------------------------------------------------------------------
 ADAPTERS: dict[str, dict] = {
@@ -229,5 +356,12 @@ ADAPTERS: dict[str, dict] = {
         "record_type": "SANCTION",
         "url": CANADA_URL,
         "label": "Canada — Mesures économiques spéciales (LMES)",
+    },
+    SECO_SOURCE_CODE: {
+        "name": SECO_SOURCE_NAME,
+        "fetch": fetch_seco_sanctions,
+        "record_type": "SANCTION",
+        "url": SECO_URL,
+        "label": "Suisse — SECO, liste consolidée",
     },
 }
