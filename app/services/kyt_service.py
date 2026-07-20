@@ -95,13 +95,14 @@ def _screen_party(
         logger.exception("kyt_party_screening_failed", extra={"role": role})
         return None
 
-    if not rows:
-        return None
+    # On renvoie un résultat même sans correspondance : « vérifié, rien trouvé »
+    # est une information de conformité à part entière, qui doit être tracée.
     return {
         "role": role,
         "name": name.strip(),
+        "screened": True,
         "request_id": str(res["request_id"]),
-        "score": int(rows[0]["match_score"] or 0),
+        "score": int(rows[0]["match_score"] or 0) if rows else 0,
         "is_pep": any(str(r["record_type"] or "").upper() == "PEP" for r in rows),
         "matches": [
             {
@@ -115,7 +116,13 @@ def _screen_party(
 
 
 def screen_parties(db: Session, txn: Transaction) -> list[dict]:
-    """Filtre l'émetteur (client) ET le bénéficiaire de l'opération."""
+    """
+    Filtre l'émetteur (client) ET le bénéficiaire de l'opération.
+
+    Retourne une entrée par partie exploitable, qu'elle ait été rapprochée ou
+    non : la Conformité doit pouvoir constater qu'une partie A ÉTÉ vérifiée et
+    ressort saine, et non simplement l'absence d'alerte.
+    """
     out = []
     for role, raw in (("Émetteur", txn.customer_ref), ("Bénéficiaire", txn.counterparty_name)):
         if not _screenable(raw):
@@ -124,8 +131,10 @@ def screen_parties(db: Session, txn: Transaction) -> list[dict]:
             db, name=raw, role=role,
             tenant_id=txn.tenant_id, country=txn.counterparty_country,
         )
-        if hit:
-            out.append(hit)
+        out.append(hit or {
+            "role": role, "name": (raw or "").strip(), "screened": False,
+            "score": 0, "is_pep": False, "matches": [],
+        })
     return out
 
 
@@ -170,12 +179,27 @@ def analyze_transaction(db: Session, txn: Transaction):
         # d'écrire l'évaluation et les alertes.
         from app.core.db import set_tenant_context
         set_tenant_context(db, str(txn.tenant_id))
-    if parties:
-        best = max(parties, key=lambda p: p["score"])
+    matched = [p for p in parties if p["matches"]]
+    if matched:
+        best = max(matched, key=lambda p: p["score"])
         ctx["match_score"] = best["score"]
         ctx["is_pep"] = any(p["is_pep"] for p in parties)
         ctx["matched_party"] = best["role"]
         ctx["matched_name"] = best["name"]
+    elif parties:
+        ctx["match_score"] = 0
+    if parties:
+        # Trace de conformité : qui a été filtré, et avec quel résultat.
+        ctx["screened_parties"] = [
+            {
+                "role": p["role"], "name": p["name"], "screened": p.get("screened", True),
+                "score": p["score"], "is_pep": p["is_pep"],
+                "match_count": len(p["matches"]),
+                "top_match": p["matches"][0]["name"] if p["matches"] else None,
+                "list": p["matches"][0]["source"] if p["matches"] else None,
+            }
+            for p in parties
+        ]
 
     # Libellé lisible : le CLIENT concerné en priorité (nom/prénom), pas un ID.
     label = (txn.customer_ref or "").strip() or (
@@ -199,10 +223,10 @@ def analyze_transaction(db: Session, txn: Transaction):
 
     # Trace des correspondances (nom rapproché, liste, programme) pour que la
     # Conformité voie POURQUOI l'opération est signalée.
-    if alerts and parties:
+    if alerts and matched:
         detail_screening = {
-            "subject_label": ", ".join(f"{p['role']} : {p['name']}" for p in parties),
-            "matches": [m for p in parties for m in p["matches"]],
+            "subject_label": ", ".join(f"{p['role']} : {p['name']}" for p in matched),
+            "matches": [m for p in matched for m in p["matches"]],
             "parties": [
                 {"role": p["role"], "name": p["name"], "score": p["score"], "is_pep": p["is_pep"]}
                 for p in parties

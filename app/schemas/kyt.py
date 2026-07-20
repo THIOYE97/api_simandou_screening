@@ -57,6 +57,9 @@ class IngestResult(BaseModel):
     total_score: int
     triggered: list[dict[str, Any]]
     alerts_created: int
+    # Parties filtrées contre les listes (émetteur / bénéficiaire), avec leur
+    # résultat — y compris « vérifié, aucune correspondance ».
+    parties: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SARIn(BaseModel):

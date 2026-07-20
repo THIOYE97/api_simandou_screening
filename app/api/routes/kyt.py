@@ -39,6 +39,7 @@ def ingest_transaction(payload: TransactionIn, db=Depends(get_db), user=Depends(
         total_score=assessment.total_score,
         triggered=assessment.triggered,
         alerts_created=len(alerts),
+        parties=(assessment.context or {}).get("screened_parties", []),
     )
 
 
