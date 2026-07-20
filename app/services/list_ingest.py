@@ -86,12 +86,18 @@ def ingest(
     risk_level: str = "HIGH",
     evidence_url: Optional[str] = None,
     source_type: str = "SANCTIONS",
+    max_records: Optional[int] = None,
 ) -> dict[str, int]:
     """
     Écrit les enregistrements et retourne le compte (créés / ignorés).
 
     Idempotent : un `source_ref` déjà présent pour cette source est ignoré, ce
     qui permet de relancer une mise à jour sans dupliquer.
+
+    `max_records` plafonne le nombre de CRÉATIONS par appel : les listes
+    volumineuses s'importent ainsi par tranches successives sans dépasser le
+    délai d'une requête HTTP, chaque appel reprenant là où le précédent s'est
+    arrêté. `remaining` indique s'il reste du travail.
     """
     source_id = get_or_create_source(db, code=source_code, name=source_name, source_type=source_type)
     seen = _existing_refs(db, source_id)
@@ -154,9 +160,16 @@ def ingest(
         )
 
         created += 1
+        if max_records and created >= max_records:
+            db.commit()
+            return {"created": created, "skipped": skipped,
+                    "source_id": source_id, "remaining": True}
         if created % BATCH == 0:
             db.commit()
-            logger.info("list_ingest_progress", extra={"source": source_code, "created": created})
+            # NB : « created » est un attribut RÉSERVÉ de LogRecord (horodatage).
+            # L'employer comme clé de `extra` fait lever un KeyError par logging.
+            logger.info("list_ingest_progress",
+                        extra={"source": source_code, "records_created": created})
 
     db.commit()
-    return {"created": created, "skipped": skipped, "source_id": source_id}
+    return {"created": created, "skipped": skipped, "source_id": source_id, "remaining": False}

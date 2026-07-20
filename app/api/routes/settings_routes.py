@@ -525,6 +525,7 @@ def update_user_role(
 @router.post("/settings/sources/{code}/import")
 def import_source(
     code: str,
+    max_records: int = 1500,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -554,6 +555,7 @@ def import_source(
             records=records,
             record_type=adapter.get("record_type", "SANCTION"),
             evidence_url=adapter.get("url"),
+            max_records=max_records,
         )
     except Exception as e:
         logger.exception("list_import_failed")
@@ -564,6 +566,7 @@ def import_source(
         "label": adapter.get("label"),
         "created": out["created"],
         "skipped": out["skipped"],
+        "remaining": out.get("remaining", False),
     })
 
 

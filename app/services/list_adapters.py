@@ -8,8 +8,9 @@ réel publié, pas supposé.
 from __future__ import annotations
 
 import csv
-import io
 import logging
+import os
+import tempfile
 from typing import Iterator
 
 import httpx
@@ -19,11 +20,23 @@ logger = logging.getLogger("simandou.list_adapters")
 DOWNLOAD_TIMEOUT = 300.0
 
 
-def _download_text(url: str) -> str:
+def _download_to_file(url: str) -> str:
+    """
+    Télécharge en FLUX vers un fichier temporaire.
+
+    Les listes officielles pèsent plusieurs dizaines de Mo (47 Mo pour le
+    Royaume-Uni). Les charger entièrement en mémoire faisait tomber l'instance
+    (502). On écrit sur disque et on analyse en lecture séquentielle.
+    """
+    fd, path = tempfile.mkstemp(suffix=".csv", prefix="sanctions_")
+    os.close(fd)
     with httpx.Client(timeout=DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
-        r = client.get(url)
-        r.raise_for_status()
-        return r.content.decode("utf-8-sig", errors="replace")
+        with client.stream("GET", url) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in r.iter_bytes(chunk_size=1 << 20):
+                    f.write(chunk)
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -57,24 +70,43 @@ def _uk_full_name(row: dict) -> str:
 
 def fetch_uk_sanctions(url: str = UK_SANCTIONS_URL) -> Iterator[dict]:
     """Télécharge et regroupe la UK Sanctions List par désignation."""
-    raw = _download_text(url)
-    buf = io.StringIO(raw)
-    buf.readline()                      # saute « Report Date: ... »
-    reader = csv.DictReader(buf)
-
+    path = _download_to_file(url)
     grouped: dict[str, dict] = {}
-    for row in reader:
-        uid = (row.get("Unique ID") or "").strip()
-        name = _uk_full_name(row)
-        if not uid or not name:
-            continue
+    try:
+        # Lecture LIGNE À LIGNE : matérialiser les 57 000 lignes en mémoire
+        # coûtait plusieurs centaines de Mo. Seul le regroupement est conservé.
+        with open(path, encoding="utf-8-sig", errors="replace", newline="") as fh:
+            fh.readline()               # saute « Report Date: ... »
+            for row in csv.DictReader(fh):
+                _uk_accumulate(row, grouped)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
-        dtype = (row.get("Designation Type") or "").strip().lower()
-        entity_type = "person" if dtype == "individual" else "company"
-        ntype = (row.get("Name type") or "").strip().lower()
-        is_primary = ntype == "primary name"
+    for entry in grouped.values():
+        # Certaines désignations n'ont qu'une variation : elle devient le nom principal.
+        if not entry["primary_name"]:
+            if not entry["aliases"]:
+                continue
+            entry["primary_name"] = entry["aliases"].pop(0)
+        entry.pop("_seen", None)
+        yield entry
 
-        entry = grouped.setdefault(uid, {
+
+def _uk_accumulate(row: dict, grouped: dict[str, dict]) -> None:
+    """Agrège une ligne dans la désignation à laquelle elle appartient."""
+    uid = (row.get("Unique ID") or "").strip()
+    name = _uk_full_name(row)
+    if not uid or not name:
+        return
+
+    dtype = (row.get("Designation Type") or "").strip().lower()
+    entity_type = "person" if dtype == "individual" else "company"
+    is_primary = (row.get("Name type") or "").strip().lower() == "primary name"
+
+    entry = grouped.setdefault(uid, {
             "source_ref": uid,
             "entity_type": entity_type,
             "primary_name": "",
@@ -93,22 +125,13 @@ def fetch_uk_sanctions(url: str = UK_SANCTIONS_URL) -> Iterator[dict]:
                     "source": row.get("Designation source"),
                     "sanctions": row.get("Sanctions Imposed")},
         })
-        if name in entry["_seen"]:
-            continue
-        entry["_seen"][name] = True
-        if is_primary and not entry["primary_name"]:
-            entry["primary_name"] = name
-        elif name != entry["primary_name"]:
-            entry["aliases"].append(name)
-
-    for entry in grouped.values():
-        # Certaines désignations n'ont qu'une variation : elle devient le nom principal.
-        if not entry["primary_name"]:
-            if not entry["aliases"]:
-                continue
-            entry["primary_name"] = entry["aliases"].pop(0)
-        entry.pop("_seen", None)
-        yield entry
+    if name in entry["_seen"]:
+        return
+    entry["_seen"][name] = True
+    if is_primary and not entry["primary_name"]:
+        entry["primary_name"] = name
+    elif name != entry["primary_name"]:
+        entry["aliases"].append(name)
 
 
 # --------------------------------------------------------------------------
