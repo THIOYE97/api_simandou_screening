@@ -42,6 +42,9 @@ class ScreeningDetailsOut(BaseModel):
     request: Dict[str, Any]
     result: Optional[Dict[str, Any]] = None
     matches: List[Dict[str, Any]] = Field(default_factory=list)
+    # Correspondances regroupées par personne, avec les autorités qui l'ont
+    # désignée : évite d'afficher cinq fois la même personne listée cinq fois.
+    matches_grouped: List[Dict[str, Any]] = Field(default_factory=list)
     case: Optional[Dict[str, Any]] = None
 
     decision_latest: Optional[Dict[str, Any]] = None
@@ -1234,8 +1237,8 @@ def screening_details(
             rows = db.execute(
                 text("""
                     SELECT id::int AS id,
-                           COALESCE(code::text, '') AS code,
-                           COALESCE(name::text, '') AS name
+                           COALESCE(source_code::text, '') AS code,
+                           COALESCE(source_name::text, '') AS name
                     FROM sources
                 """)
             ).mappings().all()
@@ -1354,6 +1357,11 @@ def screening_details(
             }
         )
 
+    # Regroupement inter-sources : une même personne désignée par plusieurs
+    # autorités ne doit apparaître qu'une fois, avec la liste des autorités.
+    from app.services.match_grouping import group_matches
+    matches_grouped = group_matches(matches_out)
+
     case_out = None
     if case_id:
         base_case = (case_info or {"id": case_id})
@@ -1386,6 +1394,7 @@ def screening_details(
             "notes": res_row.get("notes"),
         },
         matches=matches_out,
+        matches_grouped=matches_grouped,
         case=case_out,
         decision_latest=decision_latest,
         decision_history=decision_history,
