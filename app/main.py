@@ -22,7 +22,8 @@ init_sentry()
 # --- Routers (import après setup_logging) ---
 from app.api.routes import admin  # noqa: E402
 from app.api.routes.admin_tenants import router as admin_tenants_router  # noqa: E402
-from app.api.routes.adverse_media import router as adverse_media_router  # noqa: E402
+from app.api.routes.adverse_media import router as adverse_media_router
+from app.api.routes.blacklist import router as blacklist_router  # noqa: E402
 from app.api.routes.alerting import router as alerting_router  # noqa: E402
 from app.api.routes.analyst import router as analyst_router  # noqa: E402
 from app.api.routes.auth import router as auth_router  # noqa: E402
@@ -119,3 +120,4 @@ app.include_router(reporting_router)
 app.include_router(integration_router)
 app.include_router(rbac_router)
 app.include_router(adverse_media_router)
+app.include_router(blacklist_router)

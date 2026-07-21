@@ -1196,3 +1196,79 @@ def test_un_signalement_desactive_ne_pese_plus_sur_le_risque(db):
     assert ams.assess_company(db, "Omega Trading Ltd")["hit"] is False
     # La ligne existe toujours.
     assert db.execute(text("SELECT COUNT(*) FROM adverse_media_records")).scalar() == 1
+
+
+# ── Liste noire / interdits bancaires (TDR §VII) ──────────────────────────────
+
+_BL_CSV = ("reference,nom,type,motif,date_decision,pays\n"
+           "BCRG-A,MAMADOU INTERDIT DIALLO,person,Chèques sans provision,2026-03-14,GN\n"
+           "BCRG-B,SOCIETE INTERDITE SARL,company,Incidents de paiement,2026-04-02,GN\n"
+           "BCRG-C,AMINATA INTERDITE BAH,person,Interdiction judiciaire,2026-05-20,GN\n")
+
+
+@pytest.mark.integration
+def test_liste_noire_rejoint_l_index_de_filtrage(db):
+    """Une personne interdite doit être rapprochée par une vérification KYC au
+    même titre qu'une cible sanctionnée : le module n'a pas de moteur à part."""
+    from app.services import blacklist_service as bl
+    from app.services.matching import normalize_name, retrieve_candidates, tokenize
+
+    r = bl.importer(db, _BL_CSV.encode("utf-8"))
+    assert r["created"] == 3
+
+    q = normalize_name("MAMADOU INTERDIT DIALLO")
+    assert any(c.primary_name == "MAMADOU INTERDIT DIALLO"
+               for c in retrieve_candidates(db, q, tokenize(q), limit=20))
+
+
+@pytest.mark.integration
+def test_liste_noire_une_levee_produit_son_effet(db):
+    """Retirer une ligne du fichier reversé lève l'interdiction : la personne
+    cesse d'être rapprochée. Sans cela, une levée resterait sans effet — le
+    défaut même qui affectait les listes internationales."""
+    from app.services import blacklist_service as bl
+    from app.services.matching import normalize_name, retrieve_candidates, tokenize
+
+    bl.importer(db, _BL_CSV.encode("utf-8"))
+    sans_mamadou = "\n".join(
+        l for l in _BL_CSV.splitlines() if "BCRG-A" not in l) + "\n"
+    r = bl.importer(db, sans_mamadou.encode("utf-8"))
+    assert r["delisted"] == 1
+
+    q = normalize_name("MAMADOU INTERDIT DIALLO")
+    assert not any(c.primary_name == "MAMADOU INTERDIT DIALLO"
+                   for c in retrieve_candidates(db, q, tokenize(q), limit=20))
+    assert bl.etat(db) == {"source_id": bl.etat(db)["source_id"],
+                           "actifs": 2, "leves": 1, "total": 3}
+
+
+@pytest.mark.integration
+def test_liste_noire_simulation_n_ecrit_rien(db):
+    """Le fichier faisant autorité, une erreur de manipulation lèverait des
+    interdictions à tort : la simulation doit permettre de le voir avant."""
+    from app.services import blacklist_service as bl
+
+    bl.importer(db, _BL_CSV.encode("utf-8"))
+    avant = bl.etat(db)
+
+    une_seule = ("reference,nom,type,motif,date_decision,pays\n"
+                 "BCRG-A,MAMADOU INTERDIT DIALLO,person,Chèques,2026-03-14,GN\n")
+    sim = bl.importer(db, une_seule.encode("utf-8"), dry_run=True)
+    assert sim["dry_run"] is True
+    assert sim["would_delist"] == 2          # l'opérateur est averti
+    assert bl.etat(db) == avant              # rien n'a bougé
+
+
+@pytest.mark.integration
+def test_liste_noire_reversement_idempotent(db):
+    from app.services import blacklist_service as bl
+    bl.importer(db, _BL_CSV.encode("utf-8"))
+    r = bl.importer(db, _BL_CSV.encode("utf-8"))
+    assert r["created"] == 0 and r["delisted"] == 0
+
+
+@pytest.mark.integration
+def test_liste_noire_refuse_un_fichier_sans_reference(db):
+    from app.services import blacklist_service as bl
+    with pytest.raises(ValueError):
+        bl.importer(db, b"nom,motif\nQuelqu'un,Cheques\n")

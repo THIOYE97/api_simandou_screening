@@ -28,11 +28,15 @@ EntityType = SAEnum("person", "company", name="entity_type", create_type=False)
 
 RiskLevel = SAEnum("LOW", "MEDIUM", "HIGH", name="risk_level", create_type=False)
 
+# Valeurs EXACTES du type PostgreSQL en production, relevées par sonde :
+# le modèle déclarait « ADVERSE_MEDIA » et « BAN », qui n'existent pas, et
+# omettait « NOTICE », qui existe. L'écart ne se serait manifesté qu'au
+# premier enregistrement réel — après un déploiement réussi et une suite de
+# tests verte, puisque la base de test était construite depuis ce modèle.
 RecordType = SAEnum(
     "SANCTION",
+    "NOTICE",      # avis officiel : interdiction bancaire, décision nationale
     "PEP",
-    "ADVERSE_MEDIA",
-    "BAN",
     name="record_type",
     create_type=False,
 )

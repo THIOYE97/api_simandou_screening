@@ -126,7 +126,7 @@ def migrated_db(database_url):
             ("case_status", ["DRAFT", "PENDING_REVIEW", "ACTION_REQUIRED", "APPROVED", "REJECTED"]),
             ("risk_level", ["LOW", "MEDIUM", "HIGH"]),
             ("entity_type", ["person", "company"]),
-            ("record_type", ["SANCTION", "PEP", "ADVERSE_MEDIA", "BAN"]),
+            ("record_type", ["SANCTION", "NOTICE", "PEP"]),
             ("match_band", ["STRONG", "POSSIBLE", "WEAK"]),
             ("action_type", ["PASS", "MANUAL_REVIEW", "BLOCK"]),
             ("ocr_status", ["PENDING", "DONE", "FAILED", "LOW_CONFIDENCE"]),

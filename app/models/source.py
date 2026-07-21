@@ -10,9 +10,12 @@ from sqlalchemy import Boolean, Column, Enum, SmallInteger, Text
 
 from app.models.base import Base
 
-# Aligné sur le type PostgreSQL `source_type` déjà en place.
+# Valeurs EXACTES du type PostgreSQL `source_type`. Une première rédaction
+# citait « WATCHLIST » et « INTERNAL », qui n'existent pas — et omettait
+# « OFFICIAL_NOTICE » et « OTHER », qui sont précisément ceux dont une liste
+# propre à la BCRG a besoin.
 SourceType = Enum(
-    "SANCTIONS", "PEP_RULES", "WATCHLIST", "INTERNAL",
+    "SANCTIONS", "OFFICIAL_NOTICE", "PEP_RULES", "OTHER",
     name="source_type",
     create_type=False,
     validate_strings=False,

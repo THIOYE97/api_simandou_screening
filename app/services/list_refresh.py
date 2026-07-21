@@ -70,6 +70,7 @@ def refresh_source(
     allow_delisting: bool = True,
     dry_run: bool = False,
     force: bool = False,
+    min_coverage: float | None = None,
 ) -> dict:
     """
     Aligne la base sur le contenu frais d'une source.
@@ -186,7 +187,12 @@ def refresh_source(
     delisted = 0
     skipped_delisting = False
 
-    if actifs and len(seen) < MIN_COVERAGE_RATIO * len(actifs):
+    # Le seuil de couverture protège contre un flux externe tronqué. Il ne
+    # s'applique pas de la même façon à une liste que l'institution reverse
+    # elle-même : là, une ligne retirée EST une décision de levée, et refuser
+    # de la prendre en compte rendrait toute levée sans effet.
+    seuil = MIN_COVERAGE_RATIO if min_coverage is None else min_coverage
+    if actifs and seuil > 0 and len(seen) < seuil * len(actifs):
         # Le flux couvre trop peu : on ne radie rien.
         skipped_delisting = True
         logger.warning(
