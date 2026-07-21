@@ -7,7 +7,8 @@ Bénéficiaires effectifs — endpoints REST.
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps.auth import get_current_user
@@ -135,6 +136,65 @@ def update_member(member_id: UUID, payload: dict, db=Depends(get_db)):
 def delete_member(member_id: UUID, db=Depends(get_db)):
     if not svc.delete_member(db, member_id):
         raise HTTPException(404, "Membre introuvable")
+
+
+@router.get("/declarations/{declaration_id}/events")
+def declaration_events(declaration_id: UUID, db=Depends(get_db)):
+    """Traçabilité : qui a déclaré ou modifié quoi, et quand."""
+    return svc.list_events(db, declaration_id)
+
+
+@router.get("/declarations/{declaration_id}/documents")
+def declaration_documents(declaration_id: UUID, db=Depends(get_db)):
+    return svc.list_documents(db, declaration_id)
+
+
+@router.post("/declarations/{declaration_id}/documents", dependencies=_WRITE, status_code=201)
+async def add_declaration_document(
+    declaration_id: UUID,
+    file: UploadFile = File(...),
+    doc_type: str = Form("AUTRE"),
+    notes: Optional[str] = Form(None),
+    db=Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Dépose une pièce justificative (statuts, registre des actionnaires…)."""
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "Fichier vide.")
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(413, "Fichier trop volumineux (20 Mo maximum).")
+    out = svc.add_document(
+        db, declaration_id, filename=file.filename or "document",
+        content=content, doc_type=doc_type, mime_type=file.content_type,
+        notes=notes, user_id=user.get("id"),
+    )
+    if out is None:
+        raise HTTPException(404, "Déclaration introuvable")
+    return out
+
+
+@router.get("/documents/{document_id}/download")
+def download_document(document_id: UUID, db=Depends(get_db)):
+    from app.services.storage import get_storage
+
+    doc = svc.get_document(db, document_id)
+    if not doc:
+        raise HTTPException(404, "Pièce introuvable")
+    try:
+        stream = get_storage().open(doc.object_key)
+    except Exception:
+        raise HTTPException(404, "Fichier indisponible")
+    return StreamingResponse(
+        stream, media_type=doc.mime_type or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{doc.filename}"'},
+    )
+
+
+@router.delete("/documents/{document_id}", dependencies=_WRITE, status_code=204)
+def remove_document(document_id: UUID, db=Depends(get_db), user=Depends(get_current_user)):
+    if not svc.delete_document(db, document_id, user_id=user.get("id")):
+        raise HTTPException(404, "Pièce introuvable")
 
 
 @router.post("/declarations/{declaration_id}/screen", dependencies=_WRITE)

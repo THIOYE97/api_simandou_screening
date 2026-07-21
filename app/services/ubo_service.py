@@ -95,6 +95,7 @@ def create_declaration(
     db.flush()
     for m in members:
         _add_member_obj(db, decl, m, tenant_id)
+    log_event(db, decl, "CREATION", justification=decl.company_name, user_id=created_by)
     db.commit()
     db.refresh(decl)
     return decl
@@ -151,6 +152,7 @@ def add_member(db: Session, declaration_id: UUID, data: dict, tenant_id=None) ->
     if not decl:
         return None
     m = _add_member_obj(db, decl, data, tenant_id or decl.tenant_id)
+    log_event(db, decl, "MEMBRE_AJOUT", justification=m.full_name)
     db.commit()
     db.refresh(m)
     return m
@@ -167,6 +169,9 @@ def update_member(db: Session, member_id: UUID, data: dict) -> Optional[UboMembe
         m.is_beneficial_owner = bool(_effective_percent(db, m) >= OWNERSHIP_THRESHOLD
                                      or str(m.control_nature or "").endswith("EFFECTIVE_CONTROL")
                                      or str(m.control_nature or "").endswith("LEGAL_REPRESENTATIVE"))
+    decl = db.get(UboDeclaration, m.declaration_id)
+    if decl:
+        log_event(db, decl, "MEMBRE_MODIF", justification=m.full_name)
     db.commit()
     db.refresh(m)
     return m
@@ -176,6 +181,9 @@ def delete_member(db: Session, member_id: UUID) -> bool:
     m = db.get(UboMember, member_id)
     if not m:
         return False
+    decl = db.get(UboDeclaration, m.declaration_id)
+    if decl:
+        log_event(db, decl, "MEMBRE_RETRAIT", justification=m.full_name)
     db.delete(m)
     db.commit()
     return True
@@ -274,6 +282,8 @@ def screen_declaration(db: Session, declaration_id: UUID) -> Optional[dict]:
     )
     decl.risk_assessment_id = assessment.id
     decl.last_screened_at = datetime.now(timezone.utc)
+    log_event(db, decl, "FILTRAGE",
+              justification=f"{len(screened)} partie(s) filtrée(s) · risque {assessment.total_score}/100")
     db.commit()
 
     alerts = alerting_service.generate_from_assessment(db, assessment, source=AlertSource.UBO)
@@ -300,3 +310,116 @@ def screen_declaration(db: Session, declaration_id: UUID) -> Optional[dict]:
         "alerts_created": len(alerts),
         "members": [member_out(db, m) for m in get_members(db, declaration_id)],
     }
+
+
+# --- Traçabilité + pièces justificatives -------------------------------------
+# L'audit réutilise `compliance_events` : la Conformité doit pouvoir répondre
+# « qui a déclaré quoi, quand » sur un dossier de bénéficiaires effectifs, au
+# même titre que sur une alerte.
+
+def log_event(
+    db: Session, decl: "UboDeclaration", action: str,
+    justification: Optional[str] = None, user_id: Optional[UUID] = None,
+) -> None:
+    from app.models.compliance import ComplianceEvent
+    db.add(ComplianceEvent(
+        tenant_id=decl.tenant_id, alert_id=None,
+        subject_kind="UBO", subject_id=str(decl.id), subject_label=decl.company_name,
+        action=action[:24], to_status=None, decision=None,
+        justification=justification, actor_id=user_id,
+    ))
+
+
+def list_events(db: Session, declaration_id: UUID) -> list[dict]:
+    from app.models.compliance import ComplianceEvent
+    rows = db.execute(
+        select(ComplianceEvent)
+        .where(ComplianceEvent.subject_kind == "UBO",
+               ComplianceEvent.subject_id == str(declaration_id))
+        .order_by(ComplianceEvent.created_at.desc())
+    ).scalars().all()
+    return [{
+        "id": str(e.id), "action": e.action, "justification": e.justification,
+        "actor_id": str(e.actor_id) if e.actor_id else None,
+        "created_at": e.created_at.isoformat() if e.created_at else None,
+    } for e in rows]
+
+
+DOC_TYPES = {"STATUTS", "REGISTRE_ACTIONNAIRES", "PIECE_IDENTITE", "RCCM", "AUTRE"}
+
+
+def add_document(
+    db: Session, declaration_id: UUID, *, filename: str, content: bytes,
+    doc_type: str = "AUTRE", mime_type: Optional[str] = None,
+    member_id: Optional[UUID] = None, notes: Optional[str] = None,
+    user_id: Optional[UUID] = None,
+) -> Optional[dict]:
+    """Enregistre une pièce justificative via l'abstraction de stockage."""
+    import uuid as _uuid
+
+    from app.models.ubo import UboDocument
+    from app.services.storage import get_storage
+
+    decl = db.get(UboDeclaration, declaration_id)
+    if not decl:
+        return None
+
+    key = f"ubo/{declaration_id}/{_uuid.uuid4()}_{filename[:80]}"
+    get_storage().save(key, content, mime_type)
+
+    from app.core.config import settings
+    doc = UboDocument(
+        tenant_id=decl.tenant_id, declaration_id=declaration_id, member_id=member_id,
+        doc_type=(doc_type if doc_type in DOC_TYPES else "AUTRE"),
+        filename=filename, object_key=key, storage_backend=settings.STORAGE_BACKEND,
+        mime_type=mime_type, size_bytes=len(content), notes=notes, uploaded_by=user_id,
+    )
+    db.add(doc)
+    log_event(db, decl, "DOC_AJOUT", justification=f"{doc.doc_type} · {filename}", user_id=user_id)
+    db.commit()
+    db.refresh(doc)
+    return document_out(doc)
+
+
+def document_out(d) -> dict[str, Any]:
+    return {
+        "id": str(d.id), "declaration_id": str(d.declaration_id),
+        "member_id": str(d.member_id) if d.member_id else None,
+        "doc_type": d.doc_type, "filename": d.filename,
+        "mime_type": d.mime_type, "size_bytes": d.size_bytes, "notes": d.notes,
+        "uploaded_at": d.uploaded_at.isoformat() if d.uploaded_at else None,
+    }
+
+
+def list_documents(db: Session, declaration_id: UUID) -> list[dict]:
+    from app.models.ubo import UboDocument
+    rows = db.execute(
+        select(UboDocument)
+        .where(UboDocument.declaration_id == declaration_id)
+        .order_by(UboDocument.uploaded_at.desc())
+    ).scalars().all()
+    return [document_out(d) for d in rows]
+
+
+def get_document(db: Session, document_id: UUID):
+    from app.models.ubo import UboDocument
+    return db.get(UboDocument, document_id)
+
+
+def delete_document(db: Session, document_id: UUID, user_id: Optional[UUID] = None) -> bool:
+    from app.models.ubo import UboDocument
+    from app.services.storage import get_storage
+
+    doc = db.get(UboDocument, document_id)
+    if not doc:
+        return False
+    decl = db.get(UboDeclaration, doc.declaration_id)
+    try:
+        get_storage().delete(doc.object_key)
+    except Exception:
+        pass          # la trace en base prime sur le fichier
+    if decl:
+        log_event(db, decl, "DOC_RETRAIT", justification=doc.filename, user_id=user_id)
+    db.delete(doc)
+    db.commit()
+    return True

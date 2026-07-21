@@ -105,3 +105,34 @@ class UboMember(Base):
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class UboDocument(Base):
+    """
+    Pièce justificative d'une déclaration (statuts, registre des actionnaires,
+    pièce d'identité d'un bénéficiaire…).
+
+    Une déclaration de bénéficiaires effectifs sans document à l'appui est une
+    affirmation invérifiable : en inspection, c'est la pièce qui fait foi, pas
+    la saisie.
+    """
+    __tablename__ = "ubo_documents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    declaration_id = Column(
+        UUID(as_uuid=True), ForeignKey("ubo_declarations.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    member_id = Column(UUID(as_uuid=True), nullable=True)   # pièce liée à un maillon
+
+    doc_type = Column(String(48), nullable=False, default="AUTRE")
+    filename = Column(String, nullable=False)
+    object_key = Column(String, nullable=False)
+    storage_backend = Column(String(16), nullable=False, default="LOCAL")
+    mime_type = Column(String(128), nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    notes = Column(Text, nullable=True)
+
+    uploaded_by = Column(UUID(as_uuid=True), nullable=True)
+    uploaded_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
