@@ -376,3 +376,130 @@ def assess_company(db: Session, name: str) -> dict:
         "severity": "SEVERE" if severe else "STANDARD",
         "strong": bool(strong),
     }
+
+
+# ─── Alimentation en masse ────────────────────────────────────────────────────
+#
+# La base est restée vide parce qu'aucun écran ne permettait de la remplir :
+# seul un appel d'API unitaire existait. Une équipe de conformité travaille sur
+# tableur, pas en JSON.
+
+CSV_COLONNES = ("entity_name", "category", "source", "url", "summary")
+
+# Libellés acceptés en entrée, pour que la Conformité saisisse en français
+# sans avoir à connaître les valeurs techniques.
+_CATEGORIES_FR = {
+    "fraude": "FRAUD",
+    "corruption": "CORRUPTION",
+    "blanchiment": "MONEY_LAUNDERING",
+    "financement du terrorisme": "TERRORISM",
+    "terrorisme": "TERRORISM",
+    "trafic": "TRAFFICKING",
+    "contournement de sanctions": "SANCTIONS_EVASION",
+    "criminalite organisee": "ORGANIZED_CRIME",
+    "criminalité organisée": "ORGANIZED_CRIME",
+    "autre": "OTHER",
+}
+
+
+def normaliser_categorie(valeur: str) -> str:
+    """Accepte le code technique ou le libellé français, sinon « OTHER »."""
+    v = (valeur or "").strip()
+    if not v:
+        return "OTHER"
+    haut = v.upper().replace(" ", "_").replace("-", "_")
+    if haut in {c.value for c in AdverseMediaCategory}:
+        return haut
+    return _CATEGORIES_FR.get(v.strip().lower(), "OTHER")
+
+
+def modele_csv() -> str:
+    """Fichier d'exemple, avec des lignes montrant les usages attendus."""
+    lignes = [
+        ",".join(CSV_COLONNES),
+        'Global Mining SARL,Corruption,OCCRP,https://occrp.org/exemple,'
+        '"Soupçons de corruption sur l\'attribution de licences minières"',
+        'Atlas Trading Ltd,Blanchiment,ICIJ,,Réseau de blanchiment transfrontalier',
+        'Société Exemple SA,Autre,Presse locale,,Litige commercial signalé',
+    ]
+    return "\n".join(lignes) + "\n"
+
+
+def importer_csv(db: Session, contenu: bytes) -> dict:
+    """
+    Charge un fichier de signalements.
+
+    Idempotent sur (nom, catégorie) : réimporter le même fichier ne duplique
+    rien, ce qui permet de corriger et de recharger sans crainte.
+    """
+    import csv as _csv
+    import io as _io
+
+    try:
+        texte = contenu.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        # Les tableurs francophones exportent souvent en latin-1.
+        texte = contenu.decode("latin-1", errors="replace")
+
+    lecteur = _csv.DictReader(_io.StringIO(texte))
+    if not lecteur.fieldnames or "entity_name" not in [
+            (f or "").strip().lower() for f in lecteur.fieldnames]:
+        raise ValueError(
+            "Colonne « entity_name » absente. Colonnes attendues : "
+            + ", ".join(CSV_COLONNES)
+        )
+
+    existants = {
+        (r[0].strip().upper(), r[1])
+        for r in db.execute(text(
+            "SELECT entity_name, category::text FROM adverse_media_records")).all()
+    }
+
+    crees = ignores = 0
+    erreurs: list[str] = []
+    for i, ligne in enumerate(lecteur, start=2):
+        propre = {(k or "").strip().lower(): (v or "").strip()
+                  for k, v in ligne.items() if k}
+        nom = propre.get("entity_name", "")
+        if not nom:
+            continue
+        cat = normaliser_categorie(propre.get("category", ""))
+        if (nom.upper(), cat) in existants:
+            ignores += 1
+            continue
+        try:
+            db.execute(text("""
+                INSERT INTO adverse_media_records
+                    (id, entity_name, normalized_name, category, source, url,
+                     summary, active)
+                VALUES (gen_random_uuid(), :n, :nn,
+                        CAST(:c AS adverse_media_category), :s, :u, :r, true)
+            """), {"n": nom[:300], "nn": normalize_name(nom),
+                   "c": cat, "s": (propre.get("source") or None),
+                   "u": (propre.get("url") or None),
+                   "r": (propre.get("summary") or None)})
+            existants.add((nom.upper(), cat))
+            crees += 1
+        except Exception as e:                      # ligne fautive isolée
+            db.rollback()
+            erreurs.append(f"ligne {i} : {str(e)[:90]}")
+            if len(erreurs) >= 10:
+                break
+
+    db.commit()
+    return {"crees": crees, "ignores": ignores, "erreurs": erreurs}
+
+
+def desactiver(db: Session, record_id: str, actif: bool) -> bool:
+    """
+    Active ou désactive un signalement.
+
+    On ne supprime pas : un signalement retiré reste une information de
+    conformité, et les dossiers déjà décidés doivent rester relisibles.
+    """
+    r = db.execute(text("""
+        UPDATE adverse_media_records SET active = :a
+         WHERE id = CAST(:i AS uuid) RETURNING id
+    """), {"a": actif, "i": record_id}).first()
+    db.commit()
+    return r is not None

@@ -1116,3 +1116,83 @@ def test_dedupe_compare_les_graphies_sans_tenir_compte_de_la_casse(db):
                       {"i": copie}).scalar() == 0
     assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
                       {"i": officielle}).scalar() == 1
+
+
+# ── Alimentation de la base BCRG des médias défavorables ──────────────────────
+#
+# La base était restée vide non par oubli, mais parce qu'aucun moyen ne
+# permettait de la remplir : seul un appel unitaire existait, quand une équipe
+# de conformité travaille sur tableur.
+
+@pytest.mark.integration
+def test_import_csv_accepte_les_libelles_francais(db):
+    from sqlalchemy import text
+    from app.services import adverse_media_service as ams
+
+    db.execute(text("DELETE FROM adverse_media_records")); db.commit()
+    csv = ("entity_name,category,source,summary\n"
+           "Global Mining SARL,Corruption,OCCRP,Licences minières\n"
+           "Atlas Trading Ltd,Blanchiment,ICIJ,Réseau présumé\n"
+           "Societe X,Criminalité organisée,Presse,\n")
+    r = ams.importer_csv(db, csv.encode("utf-8"))
+    assert r["crees"] == 3 and not r["erreurs"]
+
+    cats = {x[0]: x[1] for x in db.execute(text(
+        "SELECT entity_name, category::text FROM adverse_media_records")).all()}
+    assert cats["Global Mining SARL"] == "CORRUPTION"
+    assert cats["Atlas Trading Ltd"] == "MONEY_LAUNDERING"
+    assert cats["Societe X"] == "ORGANIZED_CRIME"
+
+
+@pytest.mark.integration
+def test_import_csv_est_idempotent(db):
+    """Réimporter le même fichier ne duplique rien : la Conformité doit
+    pouvoir corriger et recharger sans crainte."""
+    from sqlalchemy import text
+    from app.services import adverse_media_service as ams
+
+    db.execute(text("DELETE FROM adverse_media_records")); db.commit()
+    csv = b"entity_name,category\nSociete Test SA,Fraude\n"
+    assert ams.importer_csv(db, csv)["crees"] == 1
+    r2 = ams.importer_csv(db, csv)
+    assert r2["crees"] == 0 and r2["ignores"] == 1
+
+
+@pytest.mark.integration
+def test_import_csv_supporte_les_exports_de_tableur(db):
+    """Excel préfixe ses exports d'un BOM et les tableurs francophones
+    encodent souvent en latin-1 : les deux doivent passer."""
+    from sqlalchemy import text
+    from app.services import adverse_media_service as ams
+
+    db.execute(text("DELETE FROM adverse_media_records")); db.commit()
+    bom = "﻿entity_name,category\r\nSociété Accentuée SA,Fraude\r\n".encode("utf-8")
+    assert ams.importer_csv(db, bom)["crees"] == 1
+    latin = "entity_name,category\nSociété Latin SA,Corruption\n".encode("latin-1")
+    assert ams.importer_csv(db, latin)["crees"] == 1
+
+
+@pytest.mark.integration
+def test_import_csv_refuse_un_fichier_sans_colonne_attendue(db):
+    from app.services import adverse_media_service as ams
+    with pytest.raises(ValueError):
+        ams.importer_csv(db, b"nom,type\nQuelqu'un,Fraude\n")
+
+
+@pytest.mark.integration
+def test_un_signalement_desactive_ne_pese_plus_sur_le_risque(db):
+    """Désactiver plutôt que supprimer : le signalement reste consultable dans
+    les dossiers déjà décidés, mais cesse d'alimenter le risque."""
+    from sqlalchemy import text
+    from app.services import adverse_media_service as ams
+
+    db.execute(text("DELETE FROM adverse_media_records")); db.commit()
+    ams.importer_csv(db, b"entity_name,category\nOmega Trading Ltd,Blanchiment\n")
+    assert ams.assess_company(db, "Omega Trading Ltd")["hit"] is True
+
+    rid = db.execute(text(
+        "SELECT id::text FROM adverse_media_records LIMIT 1")).scalar()
+    assert ams.desactiver(db, rid, False) is True
+    assert ams.assess_company(db, "Omega Trading Ltd")["hit"] is False
+    # La ligne existe toujours.
+    assert db.execute(text("SELECT COUNT(*) FROM adverse_media_records")).scalar() == 1

@@ -4,7 +4,8 @@ Adverse media : endpoints REST.
 - /adverse-media/screen   : rapprocher un nom candidat de la base adverse media
 - /adverse-media/records  : consulter / alimenter la base
 """
-from fastapi import APIRouter, Depends, Query
+from fastapi import (APIRouter, Depends, File, HTTPException, Query,
+                     Response, UploadFile)
 
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db_rls as get_db
@@ -53,6 +54,48 @@ def list_records(db=Depends(get_db)):
 @router.post("/records", response_model=RecordOut, dependencies=[Depends(require("lists:manage"))])
 def add_record(payload: RecordIn, db=Depends(get_db)):
     return svc.add_record(db, payload.model_dump())
+
+
+@router.get("/template.csv", dependencies=[Depends(require("lists:manage"))])
+def template():
+    """Modèle de fichier à remplir par la Conformité."""
+    return Response(
+        content=svc.modele_csv(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition":
+                 'attachment; filename="modele-medias-defavorables.csv"'},
+    )
+
+
+@router.post("/import", dependencies=[Depends(require("lists:manage"))])
+async def importer(fichier: UploadFile = File(...), db=Depends(get_db)):
+    """
+    Import en masse depuis un tableur.
+
+    La base était restée vide faute de moyen de la remplir : seul un appel
+    unitaire existait, quand une équipe de conformité travaille sur tableur.
+    """
+    if not (fichier.filename or "").lower().endswith(".csv"):
+        raise HTTPException(400, "Le fichier doit être au format CSV.")
+    contenu = await fichier.read()
+    if len(contenu) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Fichier trop volumineux (5 Mo maximum).")
+    try:
+        return svc.importer_csv(db, contenu)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.patch("/records/{record_id}", dependencies=[Depends(require("lists:manage"))])
+def basculer(record_id: str, actif: bool = Query(...), db=Depends(get_db)):
+    """
+    Active ou désactive un signalement — jamais de suppression : un signalement
+    retiré reste une information de conformité, et les dossiers déjà décidés
+    doivent rester relisibles.
+    """
+    if not svc.desactiver(db, record_id, actif):
+        raise HTTPException(404, "Signalement introuvable.")
+    return {"id": record_id, "active": actif}
 
 
 @router.post("/seed", dependencies=[Depends(require("lists:manage"))])
