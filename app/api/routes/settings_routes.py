@@ -526,6 +526,8 @@ def update_user_role(
 def import_source(
     code: str,
     max_records: int = 1500,
+    year: Optional[int] = None,
+    edition: Optional[int] = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -547,13 +549,21 @@ def import_source(
                    + ", ".join(sorted(list_adapters.ADAPTERS)),
         )
     try:
-        records = adapter["fetch"]()
+        # Certaines sources se moissonnent édition par édition : sans cela,
+        # chaque tranche re-téléchargerait l'intégralité de l'historique.
+        kwargs = {}
+        for key, value in (("year", year), ("edition", edition)):
+            if value is not None and key in (adapter.get("accepts") or []):
+                kwargs[key] = value
+        records = adapter["fetch"](**kwargs)
         out = list_ingest.ingest(
             db,
             source_code=code.upper(),
             source_name=adapter["name"],
             records=records,
             record_type=adapter.get("record_type", "SANCTION"),
+            risk_level=adapter.get("risk_level", "HIGH"),
+            source_type=adapter.get("source_type", "SANCTIONS"),
             evidence_url=adapter.get("url"),
             max_records=max_records,
         )

@@ -475,6 +475,113 @@ def parse_dfat_sanctions(path: str) -> Iterator[dict]:
 
 
 # --------------------------------------------------------------------------
+# Guinée — Journal Officiel (Secrétariat Général du Gouvernement)
+# --------------------------------------------------------------------------
+# Source la plus stratégique pour la BCRG : c'est là que sont publiées les
+# nominations aux fonctions publiques, donc les personnes politiquement
+# exposées guinéennes — que AUCUNE liste internationale ne couvre.
+#
+# Établi sur les éditions réelles :
+#   - URL prévisible /JO/{année}/guinee-jo-{année}-{n}.pdf, stable de 2022 à
+#     2026 ; on ne dépend donc pas de la mise en page du site ;
+#   - les PDF portent une COUCHE TEXTE (127 000 caractères pour 36 pages) :
+#     aucune reconnaissance optique nécessaire, contrairement aux documents
+#     numérisés du dépôt ;
+#   - publication bimensuelle, ~24 éditions par an, ~120 personnes par édition.
+#
+# Extraction : les actes suivent la forme « Décret D/2026/165/PRG/SGG du …,
+# portant <objet> », et les personnes « Monsieur|Madame <Prénoms> <NOM> ».
+# On rattache chaque personne à l'acte qui la précède, et on QUALIFIE l'acte
+# (nomination, décoration, autre) : figurer au Journal Officiel ne fait pas de
+# quelqu'un une PPE — la Conformité doit pouvoir distinguer une nomination
+# d'une remise de décoration.
+GUINEA_JO_SOURCE_CODE = "SGG_GN"
+GUINEA_JO_SOURCE_NAME = "PPE Guinée — Journal Officiel (SGG)"
+GUINEA_JO_URL = "https://journal-officiel.sgg.gov.gn/JO/{year}/guinee-jo-{year}-{edition:02d}.pdf"
+
+_JO_ACT = re.compile(
+    r"(D[ée]cret|DECRET|Arr[êe]t[ée]|ARRETE)\s+([A-ZÀ-Ý]?/?\s?\d{4}\s?/\s?\d+[^\s,]*)"
+    r"[^,]{0,60},?\s*portant\s+([^.]{5,160})",
+    re.I,
+)
+_JO_NAME = re.compile(
+    r"(?:Monsieur|Madame|M\.|Mme)\s+((?:[A-ZÀ-Ý][\w'’\-]+\s+){0,4}[A-ZÀ-Ý]{2,}[\w'’\-]*)"
+)
+
+
+def _jo_act_kind(objet: str) -> str:
+    o = objet.lower()
+    if "nomination" in o or "nomme" in o or "nommé" in o:
+        return "NOMINATION"
+    if "mérite" in o or "merite" in o or "ordre national" in o or "décoration" in o:
+        return "DECORATION"
+    return "AUTRE"
+
+
+def parse_guinea_jo(path: str, edition_ref: str = "") -> Iterator[dict]:
+    """Extrait les personnes nommément citées d'une édition du Journal Officiel."""
+    import pypdf
+
+    reader = pypdf.PdfReader(path)
+    raw = "\n".join((p.extract_text() or "") for p in reader.pages)
+
+    # 1) Recolle les mots coupés en fin de ligne : le PDF produit « Secré -
+    #    tariats », et un patronyme ainsi scindé serait extrait tronqué ou
+    #    manqué. À faire AVANT toute normalisation des espaces.
+    txt = re.sub(r"(\w)\s*-\s*\n\s*(\w)", r"\1\2", raw)
+    # 2) Normalisation indispensable : les en-têtes d'actes sont coupés par les
+    #    sauts de ligne, et l'objet du décret s'en trouve tronqué.
+    txt = re.sub(r"\s+", " ", txt)
+
+    acts = [(m.start(), m.group(2).replace(" ", ""), m.group(3).strip())
+            for m in _JO_ACT.finditer(txt)]
+    if not acts:
+        return
+    bounds = [p for p, _, _ in acts] + [len(txt)]
+
+    seen: set[tuple[str, str]] = set()
+    for i, (_, act_ref, objet) in enumerate(acts):
+        block = txt[bounds[i]:bounds[i + 1]]
+        kind = _jo_act_kind(objet)
+        for name in _JO_NAME.findall(block):
+            name = name.strip()
+            if len(name.split()) < 2:          # un seul mot : trop ambigu
+                continue
+            key = (act_ref, name.upper())
+            if key in seen:
+                continue
+            seen.add(key)
+            yield {
+                "source_ref": f"{edition_ref}|{act_ref}|{name.upper()}",
+                "entity_type": "person",
+                "primary_name": name,
+                "aliases": [],
+                # Le « programme » porte la nature de l'acte : c'est lui qui
+                # permet à la Conformité de distinguer une nomination d'une
+                # décoration au moment de traiter une correspondance.
+                "program": f"{kind} — {objet[:120]}",
+                "listed_on": None,
+                "country": "GN",
+                "summary": f"Journal Officiel {edition_ref} · {act_ref} · {objet[:400]}",
+                "raw": {"edition": edition_ref, "act_ref": act_ref,
+                        "act_kind": kind, "objet": objet[:400]},
+            }
+
+
+def fetch_guinea_jo(year: int = 2026, edition: int = 1) -> Iterator[dict]:
+    """Télécharge puis analyse une édition du Journal Officiel guinéen."""
+    url = GUINEA_JO_URL.format(year=int(year), edition=int(edition))
+    path = _download_to_file(url)
+    try:
+        yield from parse_guinea_jo(path, edition_ref=f"{year}-{int(edition):02d}")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
 # Registre des adaptateurs
 # --------------------------------------------------------------------------
 ADAPTERS: dict[str, dict] = {
@@ -498,6 +605,19 @@ ADAPTERS: dict[str, dict] = {
         "record_type": "SANCTION",
         "url": SECO_URL,
         "label": "Suisse — SECO, liste consolidée",
+    },
+    GUINEA_JO_SOURCE_CODE: {
+        "name": GUINEA_JO_SOURCE_NAME,
+        "fetch": fetch_guinea_jo,
+        "parse": parse_guinea_jo,
+        "record_type": "PEP",
+        # Être cité au Journal Officiel n'est pas être sanctionné : le risque
+        # attaché reste modéré, à charge pour le scoring de le pondérer.
+        "risk_level": "MEDIUM",
+        "source_type": "PEP_RULES",
+        "accepts": ["year", "edition"],
+        "url": "https://journal-officiel.sgg.gov.gn",
+        "label": "Guinée — Journal Officiel (nominations et actes)",
     },
     DFAT_SOURCE_CODE: {
         "name": DFAT_SOURCE_NAME,
