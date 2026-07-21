@@ -1038,3 +1038,28 @@ def test_dedupe_epargne_une_entite_unique(db):
     dedupe_entities.supprimer(db)
     assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
                       {"i": seule}).scalar() == 1
+
+
+@pytest.mark.integration
+def test_dedupe_epargne_une_copie_plus_riche_en_alias(db):
+    """Une copie qui porte plus de libellés que sa jumelle est conservée :
+    la supprimer ferait cesser de reconnaître des graphies aujourd'hui
+    couvertes. Un alias perdu, c'est une personne qu'on ne détecte plus."""
+    from sqlalchemy import text
+    from app.scripts import dedupe_entities
+    from app.services.matching import normalize_name, tokenize
+
+    _entite(db, "OMAR RICHE", avec_source=True)          # 1 seul libellé
+    copie = _entite(db, "Omar Riche")                     # même personne
+    for alias in ("OMAR AL-RICHE", "OMAR RICHÉ"):         # graphies supplémentaires
+        n = normalize_name(alias)
+        db.execute(text("""
+            INSERT INTO entity_names (entity_id, name_raw, name_normalized,
+                                      name_tokens, is_primary, name_type)
+            VALUES (CAST(:i AS uuid), :r, :n, :t, false, 'ALIAS')
+        """), {"i": copie, "r": alias, "n": n, "t": tokenize(n)})
+    db.commit()
+
+    dedupe_entities.supprimer(db)
+    assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
+                      {"i": copie}).scalar() == 1

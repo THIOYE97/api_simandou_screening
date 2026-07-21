@@ -69,14 +69,29 @@ WITH orphelines AS (
       FROM entities e
      WHERE NOT ({ref})
 ),
+-- Pour chaque nom, le nombre de libellés que porte la version rattachée
+-- à une source : c'est lui qui détermine le pouvoir de rapprochement.
 officielles AS (
-    SELECT DISTINCT UPPER(TRIM(e.primary_name)) AS cle
+    SELECT UPPER(TRIM(e.primary_name)) AS cle, MAX(k.n) AS n_libelles
       FROM entities e
       JOIN source_records sr ON sr.entity_id = e.id
+      JOIN (SELECT entity_id, COUNT(*) n FROM entity_names GROUP BY entity_id) k
+        ON k.entity_id = e.id
+     GROUP BY UPPER(TRIM(e.primary_name))
+),
+richesse AS (
+    SELECT o.id, COUNT(en.id) AS n_libelles
+      FROM orphelines o LEFT JOIN entity_names en ON en.entity_id = o.id
+     GROUP BY o.id
 )
 SELECT o.id, o.primary_name, o.entity_type
   FROM orphelines o
   JOIN officielles f ON f.cle = o.cle
+  JOIN richesse   r ON r.id = o.id
+ -- Une copie qui porte PLUS de libellés que sa jumelle est conservée :
+ -- la supprimer ferait cesser de reconnaître des graphies aujourd'hui
+ -- couvertes. Un alias perdu, c'est une personne qu'on ne détecte plus.
+ WHERE r.n_libelles <= f.n_libelles
 """
 
 
@@ -95,8 +110,37 @@ def analyser(db) -> dict:
     sql = _sql_candidats(db)
     candidats = db.execute(text(f"SELECT COUNT(*) FROM ({sql}) c")).scalar()
     exemples = db.execute(text(f"{sql} ORDER BY o.primary_name LIMIT 8")).mappings().all()
+    # Contrôle de non-régression du filtrage : supprimer une copie qui porte
+    # PLUS de libellés que sa jumelle ferait perdre du pouvoir de rapprochement.
+    # Un nom d'alias en moins, c'est une personne qu'on cesse de reconnaître.
+    # Copies plus riches que leur jumelle : exclues de la suppression par la
+    # requête ci-dessus, comptées ici pour être signalées.
+    ref2 = ref
+    plus_riches = db.execute(text(f"""
+        WITH orph AS (
+            SELECT e.id, UPPER(TRIM(e.primary_name)) AS cle
+              FROM entities e WHERE NOT ({ref2})
+        ),
+        n_orph AS (
+            SELECT o.id, o.cle, COUNT(en.id) AS n
+              FROM orph o LEFT JOIN entity_names en ON en.entity_id = o.id
+             GROUP BY o.id, o.cle
+        ),
+        n_off AS (
+            SELECT UPPER(TRIM(e.primary_name)) AS cle, MAX(k.n) AS n
+              FROM entities e
+              JOIN source_records sr ON sr.entity_id = e.id
+              JOIN (SELECT entity_id, COUNT(*) n FROM entity_names GROUP BY entity_id) k
+                ON k.entity_id = e.id
+             GROUP BY UPPER(TRIM(e.primary_name))
+        )
+        SELECT COUNT(*) FROM n_orph o
+          JOIN n_off f ON f.cle = o.cle
+         WHERE o.n > f.n
+    """)).scalar()
     return {"total": total, "sans_source": sans_source, "protegees": protegees,
-            "candidats": candidats, "exemples": [dict(x) for x in exemples]}
+            "candidats": candidats, "plus_riches": plus_riches,
+            "exemples": [dict(x) for x in exemples]}
 
 
 def supprimer(db) -> int:
@@ -130,6 +174,9 @@ def main(argv: list[str]) -> int:
         print(f"  sans enregistrement source: {a['sans_source']:>7}")
         print(f"  dont référencées ailleurs : {a['protegees']:>7}  (conservées)")
         print(f"  doublons supprimables     : {a['candidats']:>7}")
+        print(f"  dont plus riches en alias : {a['plus_riches']:>7}"
+              + ("  (conservées : elles couvrent des graphies que la version"
+                 " rattachée à une source ignore)" if a["plus_riches"] else ""))
         if a["exemples"]:
             print("\n  exemples :")
             for x in a["exemples"]:
