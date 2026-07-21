@@ -104,7 +104,7 @@ def refresh_source(
     recouvrement = 1.0
     if existing and refs_frais:
         recouvrement = len(refs_frais & set(existing)) / len(refs_frais)
-        if recouvrement < MIN_REF_OVERLAP and not force:
+        if recouvrement < MIN_REF_OVERLAP and not force and not dry_run:
             raise RefConventionMismatch(
                 f"{source_code} : seules {recouvrement:.0%} des références reçues "
                 f"correspondent aux {len(existing)} déjà en base. La convention "
@@ -119,6 +119,10 @@ def refresh_source(
             "overlap": round(recouvrement, 4),
             "would_create": len(refs_frais - set(existing)),
             "would_delist": len({r for r, (_, u) in existing.items() if u is None} - refs_frais),
+            # Échantillons des deux conventions : sans eux, réconcilier une
+            # source revient à deviner le format attendu.
+            "sample_existing": sorted(existing)[:4],
+            "sample_fresh": sorted(refs_frais)[:4],
         }
 
     seen: set[str] = set()

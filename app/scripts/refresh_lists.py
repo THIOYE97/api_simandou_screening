@@ -119,9 +119,13 @@ def main(argv: list[str]) -> int:
     if dry:
         print("\n─── Simulation (aucune écriture) ───")
         for r in resultats:
+            drapeau = "  ⛔ REFUSE" if r["overlap"] < list_refresh.MIN_REF_OVERLAP else "  ✅"
             print(f"  {r['source']:<8} reçues={r['fresh']:>7}  en base={r['existing']:>7}  "
                   f"recouvrement={r['overlap']:>6.1%}  "
-                  f"créerait={r['would_create']:>6}  radierait={r['would_delist']:>6}")
+                  f"créerait={r['would_create']:>6}  radierait={r['would_delist']:>6}{drapeau}")
+            if r["overlap"] < list_refresh.MIN_REF_OVERLAP:
+                print(f"             en base : {r['sample_existing']}")
+                print(f"             reçues  : {r['sample_fresh']}")
         if echecs:
             print(f"\n  ⚠ refusées : {', '.join(echecs)}")
         return 0
