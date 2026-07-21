@@ -426,3 +426,119 @@ def test_ubo_legal_representative_is_always_beneficial_owner(db):
         "ownership_percent": 0, "control_nature": "LEGAL_REPRESENTATIVE",
     })
     assert ubo_service.member_out(db, gerant)["is_beneficial_owner"] is True
+
+
+# ── Médias défavorables sur les personnes morales ─────────────────────────────
+
+def _seed_adverse(db, name: str, category: str = "MONEY_LAUNDERING", active: bool = True):
+    from sqlalchemy import text
+    from app.services.matching import normalize_name
+    db.execute(text("""
+        INSERT INTO adverse_media_records
+            (id, entity_name, normalized_name, category, source, summary, active)
+        VALUES (gen_random_uuid(), :n, :nn,
+                CAST(:c AS adverse_media_category), 'TEST', 'test', :a)
+    """), {"n": name, "nn": normalize_name(name), "c": category, "a": active})
+    db.commit()
+
+
+@pytest.mark.integration
+def test_adverse_media_rapproche_les_formes_juridiques(db):
+    """« Limited » et « Ltd » désignent la même société : le rapprochement doit
+    aboutir. Sans canonisation, le score tombait à 61 pour un seuil de 65."""
+    from app.services import adverse_media_service as ams
+    _seed_adverse(db, "Atlas Trading Ltd")
+
+    assert ams.assess_company(db, "Atlas Trading Limited")["hit"] is True
+    assert ams.assess_company(db, "ATLAS TRADING LIMITED")["hit"] is True
+
+
+@pytest.mark.integration
+def test_adverse_media_ne_confond_pas_deux_societes(db):
+    """Une dénomination voisine ne doit pas être tenue pour la même entité."""
+    from app.services import adverse_media_service as ams
+    _seed_adverse(db, "Atlas Trading Ltd")
+
+    assert ams.assess_company(db, "Boreal Trading Ltd")["hit"] is False
+    assert ams.assess_company(db, "Atlas Shipping Ltd")["hit"] is False
+
+
+@pytest.mark.integration
+def test_adverse_media_ignore_les_signalements_desactives(db):
+    from app.services import adverse_media_service as ams
+    _seed_adverse(db, "Ancien Dossier SA", active=False)
+    assert ams.assess_company(db, "Ancien Dossier SA")["hit"] is False
+
+
+@pytest.mark.integration
+def test_adverse_media_plancher_gradue_selon_la_force_du_rapprochement(db):
+    """Un rapprochement seulement POSSIBLE ne porte pas le dossier en risque
+    élevé : il déclenche un examen, ce qui est le bon niveau de réaction."""
+    from app.services import adverse_media_service as ams
+    _seed_adverse(db, "Atlas Trading Ltd", category="MONEY_LAUNDERING")
+
+    fort = ams.assess_company(db, "Atlas Trading Limited")
+    assert fort["risk_floor"] == "HIGH"          # fait grave + rapprochement fort
+
+    faible = ams.assess_company(db, "Atlas Trading SA")
+    assert faible["hit"] is True
+    assert faible["risk_floor"] == "MEDIUM"      # même fait grave, mais rapprochement faible
+
+
+def _make_tenant(db) -> str:
+    """La base de test ne contient aucun locataire : chaque test crée le sien."""
+    import uuid as _uuid
+    from sqlalchemy import text
+    tid = _uuid.uuid4()
+    db.execute(text("RESET ROLE"))
+    db.execute(text("SET ROLE auth_bypass_rls"))
+    db.execute(
+        text("INSERT INTO tenants (id, name, slug, status) VALUES (:t, :n, :s, 'ACTIVE')"),
+        {"t": tid, "n": f"tenant-{tid.hex[:6]}", "s": f"t-{tid.hex[:8]}"},
+    )
+    db.commit()
+    db.execute(text("RESET ROLE"))
+    return str(tid)
+
+
+@pytest.mark.integration
+def test_adverse_media_releve_le_risque_sans_jamais_bloquer(db):
+    """Effet sur la vérification d'une personne morale, mesuré en isolant le
+    signalement : le même nom doit passer de LOW/PASS à un examen imposé."""
+    from sqlalchemy import text
+    from app.core.db import set_tenant_context
+    from app.services import simple_screening_engine as eng
+
+    tid = _make_tenant(db)
+    nom = "Boreal Shipping Ltd"   # sans correspondance dans les listes de sanctions
+
+    set_tenant_context(db, tid)
+    avant = eng.run_simple_screening(db=db, name=nom, meta={"entity_type": "COMPANY"})
+    assert avant["risk_level"] == "LOW" and avant["recommended_action"] == "PASS"
+
+    # La validation opérée par _seed_adverse rend la connexion au pool et
+    # efface le contexte de locataire : il faut le reposer avant de relancer.
+    _seed_adverse(db, "Boreal Shipping Limited", category="CORRUPTION")
+
+    set_tenant_context(db, tid)
+    apres = eng.run_simple_screening(db=db, name=nom, meta={"entity_type": "COMPANY"})
+    assert apres["risk_level"] == "MEDIUM"
+    assert apres["recommended_action"] == "MANUAL_REVIEW"
+    # Un signalement de presse ne bloque JAMAIS à lui seul : la base est
+    # alimentée par la Conformité et un homonyme y est toujours possible.
+    assert apres["recommended_action"] != "BLOCK"
+
+
+@pytest.mark.integration
+def test_adverse_media_ne_sapplique_pas_aux_personnes_physiques(db):
+    from sqlalchemy import text
+    from app.core.db import set_tenant_context
+    from app.services import simple_screening_engine as eng
+
+    tid = _make_tenant(db)
+    _seed_adverse(db, "Boreal Shipping Limited", category="CORRUPTION")
+
+    set_tenant_context(db, tid)
+    r = eng.run_simple_screening(db=db, name="Boreal Shipping Ltd",
+                                 meta={"entity_type": "INDIVIDUAL"})
+    assert r["risk_level"] == "LOW" and r["recommended_action"] == "PASS"

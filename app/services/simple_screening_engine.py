@@ -1,6 +1,7 @@
 # app/services/simple_screening_engine.py
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, Optional
 from uuid import UUID as UUID_T
@@ -16,6 +17,8 @@ from app.services.matching import (
     retrieve_candidates,
     tokenize,
 )
+
+logger = logging.getLogger("simandou.screening_engine")
 
 RISK_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 
@@ -202,6 +205,50 @@ def _insert_match_sql(
     )
 
 
+def _assess_adverse_media(db: Session, name: str, meta: dict | None) -> dict:
+    """
+    Volet médias défavorables, réservé aux personnes morales.
+
+    Toute défaillance est absorbée : ce volet enrichit une vérification, il ne
+    doit pas la faire échouer. Une erreur silencieuse serait toutefois pire —
+    elle est journalisée.
+    """
+    entity_type = str((meta or {}).get("entity_type") or "").upper()
+    if entity_type not in ("COMPANY", "ENTITY", "LEGAL_ENTITY", "PERSONNE_MORALE"):
+        return {"hit": False}
+    try:
+        from app.services import adverse_media_service as ams
+        return ams.assess_company(db, name)
+    except Exception:
+        logger.exception("adverse_media_assessment_failed")
+        return {"hit": False, "failed": True}
+
+
+def _persist_adverse_media(db: Session, request_id, adverse: dict) -> None:
+    """
+    Consigne l'instantané dans la demande : un dossier LBC/FT doit pouvoir être
+    relu tel qu'il se présentait à la décision, même si la base évolue ensuite.
+    """
+    try:
+        db.execute(
+            text("""
+                UPDATE screening_requests
+                   SET request_payload = jsonb_set(
+                         COALESCE(request_payload, '{}'::jsonb),
+                         '{adverse_media}', CAST(:v AS jsonb), true)
+                 WHERE id = CAST(:rid AS uuid)
+            """),
+            {"v": json.dumps({
+                "hit": True,
+                "severity": adverse.get("severity"),
+                "risk_floor": adverse.get("risk_floor"),
+                "matches": adverse.get("matches") or [],
+            }, ensure_ascii=False), "rid": str(request_id)},
+        )
+    except Exception:
+        logger.exception("adverse_media_persist_failed")
+
+
 def run_simple_screening(
     *,
     db: Session,
@@ -350,6 +397,17 @@ def run_simple_screening(
 
         confidence = top_score if recommended != "PASS" else 0
         risk = _max_risk([str(getattr(c, "entity_risk", "LOW") or "LOW") for c in top_hits])
+
+        # 4bis) Médias défavorables — systématique sur les personnes morales.
+        # Un signalement relève le niveau de risque et impose un examen humain,
+        # mais ne bloque JAMAIS à lui seul : la base est alimentée par la
+        # Conformité et un homonyme y est toujours possible.
+        adverse = _assess_adverse_media(db, name, meta)
+        if adverse.get("hit"):
+            risk = _max_risk([risk, adverse["risk_floor"]])
+            if recommended == "PASS":
+                recommended = "MANUAL_REVIEW"
+            _persist_adverse_media(db, req.id, adverse)
 
         _insert_result_sql(
             db,

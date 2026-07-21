@@ -45,6 +45,9 @@ class ScreeningDetailsOut(BaseModel):
     # Correspondances regroupées par personne, avec les autorités qui l'ont
     # désignée : évite d'afficher cinq fois la même personne listée cinq fois.
     matches_grouped: List[Dict[str, Any]] = Field(default_factory=list)
+    # Médias défavorables : instantané pris lors de la vérification. Présent
+    # uniquement pour les personnes morales, et seulement en cas de signalement.
+    adverse_media: Optional[Dict[str, Any]] = None
     case: Optional[Dict[str, Any]] = None
 
     decision_latest: Optional[Dict[str, Any]] = None
@@ -1362,6 +1365,12 @@ def screening_details(
     from app.services.match_grouping import group_matches
     matches_grouped = group_matches(matches_out)
 
+    # L'instantané consigné à la vérification prime : le dossier doit se relire
+    # tel qu'il se présentait à la décision, même si la base a évolué depuis.
+    adverse_media_out = req_payload.get("adverse_media")
+    if not isinstance(adverse_media_out, dict):
+        adverse_media_out = None
+
     case_out = None
     if case_id:
         base_case = (case_info or {"id": case_id})
@@ -1395,6 +1404,7 @@ def screening_details(
         },
         matches=matches_out,
         matches_grouped=matches_grouped,
+        adverse_media=adverse_media_out,
         case=case_out,
         decision_latest=decision_latest,
         decision_history=decision_history,
