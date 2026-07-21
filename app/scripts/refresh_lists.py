@@ -13,6 +13,7 @@ l'API — l'API s'arrêterait parce qu'une liste se met à jour.
 
     python -m app.scripts.refresh_lists            # toutes les sources
     python -m app.scripts.refresh_lists UK CA      # sélection
+    python -m app.scripts.refresh_lists --dry-run  # simulation, sans écriture
 """
 from __future__ import annotations
 
@@ -21,7 +22,8 @@ import sys
 import time
 
 from app.core.db import SessionLocal
-from app.services import list_adapters, list_refresh, list_rescreen
+from app.services import (list_adapters, list_notifier, list_refresh,
+                          list_rescreen)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +50,11 @@ def _selectable() -> dict[str, dict]:
 
 
 def main(argv: list[str]) -> int:
-    demandees = [c.upper() for c in argv[1:]] or None
+    args = argv[1:]
+    # La simulation permet de contrôler la convention d'identifiants et le
+    # volume attendu AVANT d'écrire quoi que ce soit sur une base réelle.
+    dry = "--dry-run" in args
+    demandees = [c.upper() for c in args if not c.startswith("-")] or None
     sources = _selectable()
     if demandees:
         inconnues = [c for c in demandees if c not in list_adapters.ADAPTERS]
@@ -60,6 +66,7 @@ def main(argv: list[str]) -> int:
 
     resultats: list[dict] = []
     echecs: list[str] = []
+    debut = time.monotonic()
 
     for code, adapter in sorted(sources.items()):
         t0 = time.monotonic()
@@ -75,7 +82,12 @@ def main(argv: list[str]) -> int:
                 record_type=adapter.get("record_type", "SANCTION"),
                 risk_level=adapter.get("risk_level", "HIGH"),
                 source_type=adapter.get("source_type", "SANCTIONS"),
+                dry_run=dry,
             )
+            if dry:
+                res["duration_s"] = round(time.monotonic() - t0, 1)
+                resultats.append(res)
+                continue
             # Exigence TDR : re-profiler le portefeuille à chaque mise à jour.
             # Un échec ici ne doit pas invalider un rafraîchissement réussi.
             try:
@@ -89,6 +101,10 @@ def main(argv: list[str]) -> int:
             res["duration_s"] = round(time.monotonic() - t0, 1)
             res.pop("new_entity_ids", None)     # volumineux, inutile au rapport
             resultats.append(res)
+        except list_refresh.RefConventionMismatch as e:
+            db.rollback()
+            echecs.append(f"{code} (convention d'identifiants)")
+            logger.error("refresh_ref_mismatch", extra={"source": code, "reason": str(e)})
         except Exception as e:
             db.rollback()
             echecs.append(code)
@@ -97,6 +113,20 @@ def main(argv: list[str]) -> int:
             logger.exception("refresh_failed", extra={"source": code, "reason": str(e)[:200]})
         finally:
             db.close()
+
+    # Compte rendu à la Conformité : elle doit garder une trace écrite de
+    # chaque mise à jour, y compris des échecs.
+    if dry:
+        print("\n─── Simulation (aucune écriture) ───")
+        for r in resultats:
+            print(f"  {r['source']:<8} reçues={r['fresh']:>7}  en base={r['existing']:>7}  "
+                  f"recouvrement={r['overlap']:>6.1%}  "
+                  f"créerait={r['would_create']:>6}  radierait={r['would_delist']:>6}")
+        if echecs:
+            print(f"\n  ⚠ refusées : {', '.join(echecs)}")
+        return 0
+
+    list_notifier.notify_refresh(resultats, echecs, time.monotonic() - debut)
 
     print("\n─── Rafraîchissement des listes ───")
     for r in resultats:

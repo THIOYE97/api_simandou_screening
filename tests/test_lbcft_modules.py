@@ -885,3 +885,57 @@ def test_refiltrage_du_portefeuille_apres_mise_a_jour(db):
     out2 = list_rescreen.rescreen_for_entities(db, r["new_entity_ids"],
                                                source_code="T_RESCREEN")
     assert out2["alerts"] == 0
+
+
+@pytest.mark.integration
+def test_refresh_refuse_un_changement_de_convention_d_identifiants(db):
+    """Le cas s'est présenté en production : les listes ONU / OFAC / UE avaient
+    été chargées par des scripts ponctuels dont la convention de référence
+    différait de celle des adaptateurs (« OFAC-SDN-6636 » contre « OFAC-6636 »).
+    Sans garde-fou, le moteur aurait vu 18 000 inscriptions nouvelles et 18 000
+    radiations simultanées : base doublée, liste réelle éteinte."""
+    from app.services import list_refresh
+
+    def flux(prefixe):
+        return [{"source_ref": f"{prefixe}{i}", "primary_name": f"CONV NUMERO {i}",
+                 "entity_type": "person", "aliases": []} for i in range(50)]
+
+    list_refresh.refresh_source(db, source_code="T_CONV", source_name="Test",
+                                records=iter(flux("A-")))
+
+    with pytest.raises(list_refresh.RefConventionMismatch):
+        list_refresh.refresh_source(db, source_code="T_CONV", source_name="Test",
+                                    records=iter(flux("B-")))
+
+    # La même convention passe sans encombre.
+    r = list_refresh.refresh_source(db, source_code="T_CONV", source_name="Test",
+                                    records=iter(flux("A-")))
+    assert r["created"] == 0 and r["delisted"] == 0
+
+
+@pytest.mark.integration
+def test_refresh_simulation_n_ecrit_rien(db):
+    """La simulation doit permettre de contrôler volume et convention sur une
+    base réelle sans rien y modifier."""
+    from sqlalchemy import text
+    from app.services import list_refresh
+
+    def flux(n):
+        return [{"source_ref": f"S-{i}", "primary_name": f"SIMU NUMERO {i}",
+                 "entity_type": "person", "aliases": []} for i in range(n)]
+
+    list_refresh.refresh_source(db, source_code="T_SIMU", source_name="Test",
+                               records=iter(flux(30)))
+
+    def compte():
+        return db.execute(text("""
+            SELECT COUNT(*) FROM source_records sr JOIN sources s ON s.id = sr.source_id
+             WHERE s.source_code = 'T_SIMU'
+        """)).scalar()
+
+    avant = compte()
+    sim = list_refresh.refresh_source(db, source_code="T_SIMU", source_name="Test",
+                                      records=iter(flux(40)), dry_run=True)
+    assert sim["dry_run"] is True
+    assert sim["would_create"] == 10
+    assert compte() == avant          # rien n'a été écrit

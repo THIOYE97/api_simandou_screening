@@ -38,6 +38,19 @@ logger = logging.getLogger("simandou.list_refresh")
 # pire scénario pour un dispositif de sanctions.
 MIN_COVERAGE_RATIO = 0.80
 
+# Recouvrement minimal entre les références fraîches et celles déjà en base.
+# Si un adaptateur change de convention d'identifiant — « OFAC-6636 » au lieu
+# de « OFAC-SDN-6636 » —, AUCUNE référence ne se retrouve : le moteur croirait
+# à 18 000 inscriptions nouvelles et à 18 000 radiations simultanées, doublant
+# la base et éteignant la liste réelle. Ce cas s'est présenté : les listes
+# ONU / OFAC / UE avaient été chargées par des scripts ponctuels dont la
+# convention différait de celle des adaptateurs.
+MIN_REF_OVERLAP = 0.50
+
+
+class RefConventionMismatch(RuntimeError):
+    """Les références fraîches ne correspondent pas à celles déjà en base."""
+
 
 def _source_id(db: Session, code: str) -> Optional[int]:
     return db.execute(
@@ -55,6 +68,8 @@ def refresh_source(
     risk_level: str = "HIGH",
     source_type: str = "SANCTIONS",
     allow_delisting: bool = True,
+    dry_run: bool = False,
+    force: bool = False,
 ) -> dict:
     """
     Aligne la base sur le contenu frais d'une source.
@@ -79,12 +94,39 @@ def refresh_source(
         """), {"s": src_id}).mappings()
     }
 
+    # Le flux est matérialisé pour pouvoir contrôler la convention
+    # d'identifiants AVANT d'écrire quoi que ce soit.
+    frais = [r for r in records
+             if str(r.get("source_ref") or "").strip()
+             and (r.get("primary_name") or "").strip()]
+    refs_frais = {str(r["source_ref"]).strip() for r in frais}
+
+    recouvrement = 1.0
+    if existing and refs_frais:
+        recouvrement = len(refs_frais & set(existing)) / len(refs_frais)
+        if recouvrement < MIN_REF_OVERLAP and not force:
+            raise RefConventionMismatch(
+                f"{source_code} : seules {recouvrement:.0%} des références reçues "
+                f"correspondent aux {len(existing)} déjà en base. La convention "
+                f"d'identifiants a probablement changé — écriture refusée pour ne "
+                f"pas dupliquer la source et radier l'existant."
+            )
+
+    if dry_run:
+        return {
+            "source": source_code, "source_id": src_id, "dry_run": True,
+            "fresh": len(refs_frais), "existing": len(existing),
+            "overlap": round(recouvrement, 4),
+            "would_create": len(refs_frais - set(existing)),
+            "would_delist": len({r for r, (_, u) in existing.items() if u is None} - refs_frais),
+        }
+
     seen: set[str] = set()
     reinscrites: set[str] = set()
     to_create: list[dict] = []
     created = updated = relisted = unchanged = 0
 
-    for rec in records:
+    for rec in frais:
         ref = str(rec.get("source_ref") or "").strip()
         primary = (rec.get("primary_name") or "").strip()
         if not ref or not primary:
