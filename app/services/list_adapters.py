@@ -8,10 +8,12 @@ réel publié, pas supposé.
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import os
 import re
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from typing import Iterator
 
@@ -22,7 +24,7 @@ logger = logging.getLogger("simandou.list_adapters")
 DOWNLOAD_TIMEOUT = 300.0
 
 
-def _download_to_file(url: str) -> str:
+def _download_to_file(url: str, cache_hours: float = 0) -> str:
     """
     Télécharge en FLUX vers un fichier temporaire.
 
@@ -34,6 +36,19 @@ def _download_to_file(url: str) -> str:
     # suffixe reconnu (.xlsx/.xlsm). Un suffixe « .csv » codé en dur faisait
     # échouer toute source Excel avec un message trompeur sur le format.
     suffix = os.path.splitext(url.split("?")[0])[1] or ".dat"
+
+    # Cache disque : un import volumineux se fait par tranches successives, et
+    # sans cache chaque tranche retéléchargerait la source entière — 70 Mo pour
+    # l'archive ICIJ, soit des dizaines de gigaoctets sur un import complet.
+    if cache_hours > 0:
+        digest = hashlib.sha256(url.encode()).hexdigest()[:20]
+        cached = os.path.join(tempfile.gettempdir(), f"listcache_{digest}{suffix}")
+        if os.path.exists(cached):
+            age_h = (time.time() - os.path.getmtime(cached)) / 3600
+            if age_h < cache_hours and os.path.getsize(cached) > 1024:
+                logger.info("list_download_cache_hit", extra={"source_url": url})
+                return cached
+
     fd, path = tempfile.mkstemp(suffix=suffix, prefix="sanctions_")
     os.close(fd)
     # Plusieurs portails officiels sont protégés par un pare-feu applicatif qui
@@ -54,6 +69,13 @@ def _download_to_file(url: str) -> str:
             with open(path, "wb") as f:
                 for chunk in r.iter_bytes(chunk_size=1 << 20):
                     f.write(chunk)
+    if cache_hours > 0:
+        try:
+            os.replace(path, cached)
+            path = cached
+        except OSError:
+            pass
+
     size = os.path.getsize(path)
     if size < 1024:                    # une page d'erreur pèse quelques centaines d'octets
         os.unlink(path)

@@ -29,6 +29,7 @@ import app.models.audit  # noqa
 import app.models.referentiel  # noqa
 import app.models.scoring  # noqa
 import app.models.ubo  # noqa
+import app.models.offshore  # noqa
 import app.models.alerting  # noqa
 import app.models.kyt  # noqa
 import app.models.rbac  # noqa

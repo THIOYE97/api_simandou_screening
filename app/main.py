@@ -32,7 +32,8 @@ from app.api.routes.documents import router as documents_router  # noqa: E402
 from app.api.routes.health import router as health_router  # noqa: E402
 from app.api.routes.integration import router as integration_router  # noqa: E402
 from app.api.routes.kyt import router as kyt_router
-from app.api.routes.ubo import router as ubo_router  # noqa: E402
+from app.api.routes.ubo import router as ubo_router
+from app.api.routes.offshore import router as offshore_router  # noqa: E402
 from app.api.routes.rbac import router as rbac_router  # noqa: E402
 from app.api.routes.referentiel import router as referentiel_router  # noqa: E402
 from app.api.routes.reporting import router as reporting_router  # noqa: E402
@@ -113,6 +114,7 @@ app.include_router(scoring_router)
 app.include_router(alerting_router)
 app.include_router(kyt_router)
 app.include_router(ubo_router)
+app.include_router(offshore_router)
 app.include_router(reporting_router)
 app.include_router(integration_router)
 app.include_router(rbac_router)
