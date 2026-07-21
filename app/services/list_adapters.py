@@ -30,7 +30,11 @@ def _download_to_file(url: str) -> str:
     Royaume-Uni). Les charger entièrement en mémoire faisait tomber l'instance
     (502). On écrit sur disque et on analyse en lecture séquentielle.
     """
-    fd, path = tempfile.mkstemp(suffix=".csv", prefix="sanctions_")
+    # L'EXTENSION compte : openpyxl refuse un classeur dont le nom n'a pas de
+    # suffixe reconnu (.xlsx/.xlsm). Un suffixe « .csv » codé en dur faisait
+    # échouer toute source Excel avec un message trompeur sur le format.
+    suffix = os.path.splitext(url.split("?")[0])[1] or ".dat"
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="sanctions_")
     os.close(fd)
     # Plusieurs portails officiels sont protégés par un pare-feu applicatif qui
     # refuse les clients s'annonçant comme des scripts (« python-httpx/… »),

@@ -617,7 +617,11 @@ async def import_source_file(
             detail=f"Aucun analyseur de fichier pour « {code} ».",
         )
 
-    fd, path = tempfile.mkstemp(prefix="upload_")
+    # L'extension doit être conservée : openpyxl (comme d'autres analyseurs)
+    # valide le format d'après le NOM du fichier, pas son contenu. Un fichier
+    # temporaire sans extension est rejeté même s'il est parfaitement valide.
+    suffix = os.path.splitext(file.filename or "")[1][:12] or ".dat"
+    fd, path = tempfile.mkstemp(prefix="upload_", suffix=suffix)
     os.close(fd)
     try:
         with open(path, "wb") as out:
