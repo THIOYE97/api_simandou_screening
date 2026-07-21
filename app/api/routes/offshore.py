@@ -45,6 +45,51 @@ def offshore_search(
     }
 
 
+@router.get("/linked")
+def linked(name: str = Query(min_length=3, max_length=300),
+           is_company: bool = Query(True),
+           db=Depends(get_db)):
+    """
+    Acteurs rattachés à un sujet dans les fuites offshore.
+
+    Pour une personne morale : ceux qui la détiennent ou la dirigent.
+    Pour une personne physique : les sociétés qui lui sont rattachées.
+
+    Rattachements POTENTIELS : données arrêtées en 2020, rapprochement fait sur
+    le nom, et l'ICIJ n'est pas un registre de bénéficiaires effectifs.
+    """
+    out = svc.linked_parties(db, name, subject_is_company=is_company)
+    out["caveat"] = (
+        "Rattachements issus d'enquêtes journalistiques, arrêtés en 2020 et "
+        "rapprochés par le nom. Ils désignent des liens à vérifier, jamais une "
+        "détention établie."
+    )
+    return out
+
+
+@router.post("/import-relations", dependencies=[Depends(require("referentiel:write"))])
+def import_relations(
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50000, ge=1, le=200000),
+    db=Depends(get_db),
+):
+    """
+    Charge une tranche des liens « officer_of » depuis l'archive ICIJ.
+
+    L'archive est mise en cache sur disque comme pour l'import des nœuds :
+    sans cela, chaque tranche retéléchargerait 70 Mo.
+    """
+    from app.services import list_adapters
+
+    try:
+        path = list_adapters._download_to_file(svc.ICIJ_URL, cache_hours=72)
+        out = svc.ingest_relations(db, svc.parse_relations(path, offset=offset, limit=limit))
+    except Exception as e:
+        raise HTTPException(502, f"Import impossible : {e}")
+    return {"offset": offset, **out, "next_offset": offset + out["read"],
+            "finished": out["read"] < limit}
+
+
 @router.post("/import", dependencies=[Depends(require("referentiel:write"))])
 def offshore_import(
     kind: str = Query(..., description="OFFICER | ENTITY | INTERMEDIARY"),

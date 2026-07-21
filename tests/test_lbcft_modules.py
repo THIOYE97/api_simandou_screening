@@ -615,3 +615,89 @@ def test_press_le_cache_est_partage_et_non_en_memoire(db):
     )).scalar()
     assert n == 1
     assert ams.press_status(db, "Societe Partagee")["status"] == "DONE"
+
+
+# ── Rattachements offshore (ICIJ) ─────────────────────────────────────────────
+
+@pytest.mark.integration
+def test_classement_des_roles_offshore():
+    """716 libellés de rôle distincts doivent se ramener à quatre classes.
+    Le classement est prudent : annoncer à tort un bénéficiaire effectif est
+    plus grave que de n'en annoncer aucun."""
+    from app.services.offshore_service import classify_role
+
+    assert classify_role("ultimate beneficial owner") == "BENEFICIAL_OWNER"
+    assert classify_role("beneficiary of") == "BENEFICIAL_OWNER"
+    # Notion britannique de bénéficiaire effectif.
+    assert classify_role("person of significant control") == "BENEFICIAL_OWNER"
+    assert classify_role("shareholder of") == "SHAREHOLDER"
+    assert classify_role("director of") == "MANAGEMENT"
+    assert classify_role("auditor of") == "MANAGEMENT"
+    # Un rôle inconnu ne doit jamais être promu détention.
+    assert classify_role("linked to") == "OTHER"
+    assert classify_role("") == "OTHER"
+
+
+def _seed_offshore(db):
+    from sqlalchemy import text
+    from app.services.matching import normalize_name
+    db.execute(text("DELETE FROM offshore_relations"))
+    db.execute(text("DELETE FROM offshore_records"))
+    for nid, kind, name in [("e1", "ENTITY", "Atlas Holdings Ltd"),
+                            ("o1", "OFFICER", "Jean Dupont"),
+                            ("o2", "OFFICER", "Marie Sow")]:
+        db.execute(text("""
+            INSERT INTO offshore_records (node_id, kind, name, name_normalized)
+            VALUES (:i, CAST(:k AS offshore_kind), :n, :nn)
+        """), {"i": nid, "k": kind, "n": name, "nn": normalize_name(name)})
+    for start, end, raw, cls in [("o1", "e1", "ultimate beneficial owner", "BENEFICIAL_OWNER"),
+                                 ("o2", "e1", "auditor of", "MANAGEMENT")]:
+        db.execute(text("""
+            INSERT INTO offshore_relations
+                (node_id_start, node_id_end, rel_type, role_raw, role_class, source)
+            VALUES (:s, :e, 'officer_of', :r, :c, 'Panama Papers')
+        """), {"s": start, "e": end, "r": raw, "c": cls})
+    db.commit()
+
+
+@pytest.mark.integration
+def test_offshore_detenteurs_potentiels_d_une_societe(db):
+    """Une vérification de personne morale doit faire remonter ceux qui la
+    détiennent, le bénéficiaire effectif AVANT le simple mandataire."""
+    from app.services import offshore_service as osvc
+    _seed_offshore(db)
+
+    r = osvc.linked_parties(db, "Atlas Holdings Ltd", subject_is_company=True)
+    assert r["subject_found"] is True
+    noms = [p["name"] for p in r["parties"]]
+    assert noms == ["Jean Dupont", "Marie Sow"]      # détention avant fonction
+    assert r["parties"][0]["role_class"] == "BENEFICIAL_OWNER"
+
+
+@pytest.mark.integration
+def test_offshore_societes_rattachees_a_une_personne(db):
+    """Sens inverse : depuis une personne physique, les sociétés rattachées."""
+    from app.services import offshore_service as osvc
+    _seed_offshore(db)
+
+    r = osvc.linked_parties(db, "Jean Dupont", subject_is_company=False)
+    assert r["subject_found"] is True
+    assert [p["name"] for p in r["parties"]] == ["Atlas Holdings Ltd"]
+
+
+@pytest.mark.integration
+def test_offshore_sujet_absent_ne_renvoie_rien(db):
+    from app.services import offshore_service as osvc
+    _seed_offshore(db)
+    r = osvc.linked_parties(db, "Societe Totalement Inconnue", subject_is_company=True)
+    assert r["subject_found"] is False and r["parties"] == []
+
+
+@pytest.mark.integration
+def test_offshore_ne_confond_pas_les_natures(db):
+    """Chercher une société parmi les personnes ne doit rien donner : sans ce
+    garde-fou, un homonyme personne/société créerait un faux rattachement."""
+    from app.services import offshore_service as osvc
+    _seed_offshore(db)
+    assert osvc.linked_parties(db, "Atlas Holdings Ltd",
+                               subject_is_company=False)["subject_found"] is False

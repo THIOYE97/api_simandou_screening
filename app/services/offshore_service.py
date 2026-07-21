@@ -183,3 +183,190 @@ def stats(db: Session) -> dict:
              "attribution": ICIJ_ATTRIBUTION}
     _stats_cache.update(at=now, value=value)
     return value
+
+
+# ─── Liens entre acteurs (relations ICIJ) ─────────────────────────────────────
+
+REL_MEMBER = "relationships.csv"
+
+# L'ICIJ emploie 716 libellés de rôle distincts. Les ramener à quatre classes
+# est ce qui rend l'information lisible dans un dossier : un « ultimate
+# beneficial owner » et un « auditor of » ne se traitent pas de la même façon.
+#
+# Le classement est volontairement PRUDENT : n'est tenu pour détention que ce
+# qui l'exprime sans ambiguïté. Un rôle inconnu tombe dans OTHER plutôt que
+# d'être promu bénéficiaire par excès de zèle — annoncer à tort un
+# bénéficiaire effectif est plus grave que de n'en annoncer aucun.
+_ROLE_OWNER = (
+    "ultimate beneficial owner", "beneficial owner", "beneficiary",
+    # Notion britannique de bénéficiaire effectif : elle relève bien de la
+    # détention, et non d'un simple mandat.
+    "person of significant control",
+    "owner of", "owner", "settlor", "trustee", "protector",
+)
+_ROLE_SHARE = ("shareholder", "sole shareholder", "member of", "partner",
+               "subscriber")
+_ROLE_MGMT = (
+    "director", "secretary", "president", "vice-president", "chairman",
+    "treasurer", "manager", "managing director", "legal representative",
+    "judicial representative", "signatory", "proxy", "attorney",
+    "liquidator", "auditor", "records & registers", "officer",
+    "representative", "custodian", "administrator", "nominee",
+)
+
+
+def classify_role(raw: str) -> str:
+    """Ramène un libellé de rôle ICIJ à une classe exploitable."""
+    r = (raw or "").strip().lower()
+    if not r:
+        return "OTHER"
+    # L'ordre compte : « ultimate beneficial owner » contient « owner », et
+    # doit être reconnu comme détention avant tout autre essai.
+    for needle in _ROLE_OWNER:
+        if needle in r:
+            return "BENEFICIAL_OWNER"
+    for needle in _ROLE_SHARE:
+        if needle in r:
+            return "SHAREHOLDER"
+    for needle in _ROLE_MGMT:
+        if needle in r:
+            return "MANAGEMENT"
+    return "OTHER"
+
+
+def parse_relations(path: str, offset: int = 0, limit: int = 50000) -> Iterator[dict]:
+    """
+    Lit une tranche des arêtes, en ne retenant que les liens « officer_of ».
+
+    Les adresses partagées et les homonymies ne disent rien d'une détention et
+    représenteraient un million de lignes de bruit.
+    """
+    with zipfile.ZipFile(path) as z:
+        with z.open(REL_MEMBER) as fh:
+            reader = csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8", errors="replace"))
+            seen = produced = 0
+            for row in reader:
+                if (row.get("rel_type") or "").strip() != "officer_of":
+                    continue
+                seen += 1
+                if seen <= offset:
+                    continue
+                if produced >= limit:
+                    return
+                start = (row.get("node_id_start") or "").strip()
+                end = (row.get("node_id_end") or "").strip()
+                if not start or not end:
+                    continue
+                produced += 1
+                raw = (row.get("link") or "").strip()[:160]
+                yield {
+                    "node_id_start": start,
+                    "node_id_end": end,
+                    "rel_type": "officer_of",
+                    "role_raw": raw or None,
+                    "role_class": classify_role(raw),
+                    "source": (row.get("sourceID") or "").strip()[:128] or None,
+                }
+
+
+def ingest_relations(db: Session, records: Iterator[dict]) -> dict[str, int]:
+    read = 0
+    pending: list[dict] = []
+
+    def flush() -> None:
+        nonlocal pending
+        if not pending:
+            return
+        db.execute(text("""
+            INSERT INTO offshore_relations
+                (node_id_start, node_id_end, rel_type, role_raw, role_class, source)
+            VALUES (:node_id_start, :node_id_end, :rel_type, :role_raw, :role_class, :source)
+            ON CONFLICT (node_id_start, node_id_end, rel_type, role_raw) DO NOTHING
+        """), pending)
+        db.commit()
+        pending = []
+
+    for rec in records:
+        read += 1
+        pending.append(rec)
+        if len(pending) >= BATCH:
+            flush()
+    flush()
+    return {"read": read}
+
+
+# Ordre d'affichage : ce qui exprime une détention passe avant une fonction.
+_ROLE_RANK = {"BENEFICIAL_OWNER": 0, "SHAREHOLDER": 1, "MANAGEMENT": 2, "OTHER": 3}
+_ROLE_LABEL = {
+    "BENEFICIAL_OWNER": "Bénéficiaire effectif déclaré",
+    "SHAREHOLDER": "Actionnaire",
+    "MANAGEMENT": "Dirigeant / mandataire",
+    "OTHER": "Autre rôle",
+}
+
+
+def linked_parties(db: Session, name: str, subject_is_company: bool,
+                   limit: int = 40) -> dict:
+    """
+    Acteurs rattachés à un sujet dans les fuites offshore.
+
+    Pour une personne morale : ceux qui la détiennent ou la dirigent.
+    Pour une personne physique : les sociétés qui lui sont rattachées.
+
+    Ce sont des rattachements POTENTIELS. Les données s'arrêtent en 2020, un
+    rapprochement se fait sur le nom, et l'ICIJ n'est pas un registre de
+    bénéficiaires effectifs : rien ici n'établit une détention.
+    """
+    q = normalize_name(name or "")
+    if len(q) < 3:
+        return {"subject_found": False, "subject": None, "parties": []}
+
+    db.execute(text("SET LOCAL pg_trgm.similarity_threshold = 0.55"))
+    # Le sujet est cherché parmi les nœuds de la nature attendue : une société
+    # se retrouve côté ENTITY, une personne côté OFFICER.
+    kind = "ENTITY" if subject_is_company else "OFFICER"
+    subj = db.execute(text("""
+        SELECT node_id, name, jurisdiction, investigation, incorporation_date, status,
+               ROUND((similarity(name_normalized, :q) * 100)::numeric) AS score
+          FROM offshore_records
+         WHERE kind = CAST(:k AS offshore_kind) AND name_normalized % :q
+         ORDER BY score DESC, name
+         LIMIT 1
+    """), {"q": q, "k": kind}).mappings().first()
+    if not subj:
+        return {"subject_found": False, "subject": None, "parties": []}
+
+    # Le sens de lecture dépend de la nature du sujet : l'arête va toujours de
+    # la personne vers la société.
+    if subject_is_company:
+        sql = """
+            SELECT r.role_raw, r.role_class, r.source,
+                   o.node_id, o.name, o.countries, o.jurisdiction, o.kind::text AS kind
+              FROM offshore_relations r
+              JOIN offshore_records o
+                ON o.node_id = r.node_id_start AND o.kind <> 'ENTITY'
+             WHERE r.node_id_end = :nid
+        """
+    else:
+        sql = """
+            SELECT r.role_raw, r.role_class, r.source,
+                   o.node_id, o.name, o.countries, o.jurisdiction, o.kind::text AS kind
+              FROM offshore_relations r
+              JOIN offshore_records o
+                ON o.node_id = r.node_id_end AND o.kind = 'ENTITY'
+             WHERE r.node_id_start = :nid
+        """
+    rows = db.execute(text(sql + " LIMIT :lim"),
+                      {"nid": subj["node_id"], "lim": limit}).mappings().all()
+
+    parties = sorted(
+        ({**dict(r), "role_label": _ROLE_LABEL.get(r["role_class"], "Autre rôle")}
+         for r in rows),
+        key=lambda p: (_ROLE_RANK.get(p["role_class"], 9), p["name"] or ""),
+    )
+    return {
+        "subject_found": True,
+        "subject": {**dict(subj), "score": int(subj["score"])},
+        "parties": parties,
+        "attribution": ICIJ_ATTRIBUTION,
+    }
