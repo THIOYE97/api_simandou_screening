@@ -69,29 +69,31 @@ WITH orphelines AS (
       FROM entities e
      WHERE NOT ({ref})
 ),
--- Pour chaque nom, le nombre de libellés que porte la version rattachée
--- à une source : c'est lui qui détermine le pouvoir de rapprochement.
+-- Libellés portés par chaque entité, sous forme d'ensemble normalisé.
+-- Compter ne suffit pas : deux copies peuvent porter autant de libellés tout
+-- en couvrant des graphies différentes. Seule l'INCLUSION garantit qu'aucune
+-- graphie ne disparaît.
+libelles AS (
+    SELECT entity_id, ARRAY_AGG(DISTINCT name_normalized) AS jeu
+      FROM entity_names GROUP BY entity_id
+),
 officielles AS (
-    SELECT UPPER(TRIM(e.primary_name)) AS cle, MAX(k.n) AS n_libelles
+    SELECT UPPER(TRIM(e.primary_name)) AS cle,
+           ARRAY_AGG(DISTINCT g) AS jeu
       FROM entities e
       JOIN source_records sr ON sr.entity_id = e.id
-      JOIN (SELECT entity_id, COUNT(*) n FROM entity_names GROUP BY entity_id) k
-        ON k.entity_id = e.id
+      JOIN libelles l ON l.entity_id = e.id
+      CROSS JOIN LATERAL UNNEST(l.jeu) AS g
      GROUP BY UPPER(TRIM(e.primary_name))
-),
-richesse AS (
-    SELECT o.id, COUNT(en.id) AS n_libelles
-      FROM orphelines o LEFT JOIN entity_names en ON en.entity_id = o.id
-     GROUP BY o.id
 )
 SELECT o.id, o.primary_name, o.entity_type
   FROM orphelines o
   JOIN officielles f ON f.cle = o.cle
-  JOIN richesse   r ON r.id = o.id
- -- Une copie qui porte PLUS de libellés que sa jumelle est conservée :
- -- la supprimer ferait cesser de reconnaître des graphies aujourd'hui
- -- couvertes. Un alias perdu, c'est une personne qu'on ne détecte plus.
- WHERE r.n_libelles <= f.n_libelles
+  LEFT JOIN libelles lo ON lo.entity_id = o.id
+ -- La copie n'est supprimée que si TOUTES ses graphies sont déjà couvertes
+ -- par la version rattachée à une source. Une seule graphie manquante suffit
+ -- à la conserver : un alias perdu, c'est une personne qu'on ne détecte plus.
+ WHERE COALESCE(lo.jeu, ARRAY[]::text[]) <@ f.jeu
 """
 
 
@@ -113,30 +115,30 @@ def analyser(db) -> dict:
     # Contrôle de non-régression du filtrage : supprimer une copie qui porte
     # PLUS de libellés que sa jumelle ferait perdre du pouvoir de rapprochement.
     # Un nom d'alias en moins, c'est une personne qu'on cesse de reconnaître.
-    # Copies plus riches que leur jumelle : exclues de la suppression par la
-    # requête ci-dessus, comptées ici pour être signalées.
-    ref2 = ref
+    # Copies conservées parce qu'elles couvrent des graphies absentes de la
+    # version rattachée à une source.
     plus_riches = db.execute(text(f"""
-        WITH orph AS (
+        WITH libelles AS (
+            SELECT entity_id, ARRAY_AGG(DISTINCT name_normalized) AS jeu
+              FROM entity_names GROUP BY entity_id
+        ),
+        orph AS (
             SELECT e.id, UPPER(TRIM(e.primary_name)) AS cle
-              FROM entities e WHERE NOT ({ref2})
+              FROM entities e WHERE NOT ({ref})
         ),
-        n_orph AS (
-            SELECT o.id, o.cle, COUNT(en.id) AS n
-              FROM orph o LEFT JOIN entity_names en ON en.entity_id = o.id
-             GROUP BY o.id, o.cle
-        ),
-        n_off AS (
-            SELECT UPPER(TRIM(e.primary_name)) AS cle, MAX(k.n) AS n
+        off AS (
+            SELECT UPPER(TRIM(e.primary_name)) AS cle, ARRAY_AGG(DISTINCT g) AS jeu
               FROM entities e
               JOIN source_records sr ON sr.entity_id = e.id
-              JOIN (SELECT entity_id, COUNT(*) n FROM entity_names GROUP BY entity_id) k
-                ON k.entity_id = e.id
+              JOIN libelles l ON l.entity_id = e.id
+              CROSS JOIN LATERAL UNNEST(l.jeu) AS g
              GROUP BY UPPER(TRIM(e.primary_name))
         )
-        SELECT COUNT(*) FROM n_orph o
-          JOIN n_off f ON f.cle = o.cle
-         WHERE o.n > f.n
+        SELECT COUNT(*)
+          FROM orph o
+          JOIN off f ON f.cle = o.cle
+          LEFT JOIN libelles lo ON lo.entity_id = o.id
+         WHERE NOT (COALESCE(lo.jeu, ARRAY[]::text[]) <@ f.jeu)
     """)).scalar()
     return {"total": total, "sans_source": sans_source, "protegees": protegees,
             "candidats": candidats, "plus_riches": plus_riches,
@@ -174,7 +176,7 @@ def main(argv: list[str]) -> int:
         print(f"  sans enregistrement source: {a['sans_source']:>7}")
         print(f"  dont référencées ailleurs : {a['protegees']:>7}  (conservées)")
         print(f"  doublons supprimables     : {a['candidats']:>7}")
-        print(f"  dont plus riches en alias : {a['plus_riches']:>7}"
+        print(f"  dont graphies non couvertes: {a['plus_riches']:>7}"
               + ("  (conservées : elles couvrent des graphies que la version"
                  " rattachée à une source ignore)" if a["plus_riches"] else ""))
         if a["exemples"]:

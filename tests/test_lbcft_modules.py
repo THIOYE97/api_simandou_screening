@@ -1063,3 +1063,31 @@ def test_dedupe_epargne_une_copie_plus_riche_en_alias(db):
     dedupe_entities.supprimer(db)
     assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
                       {"i": copie}).scalar() == 1
+
+
+@pytest.mark.integration
+def test_dedupe_epargne_une_copie_aux_graphies_differentes(db):
+    """Compter les libellés ne suffit pas : deux copies peuvent en porter
+    autant tout en couvrant des graphies différentes. Seule l'inclusion
+    garantit qu'aucune graphie ne disparaît."""
+    from sqlalchemy import text
+    from app.scripts import dedupe_entities
+    from app.services.matching import normalize_name, tokenize
+
+    def alias(eid, valeur):
+        n = normalize_name(valeur)
+        db.execute(text("""
+            INSERT INTO entity_names (entity_id, name_raw, name_normalized,
+                                      name_tokens, is_primary, name_type)
+            VALUES (CAST(:i AS uuid), :r, :n, :t, false, 'ALIAS')
+        """), {"i": eid, "r": valeur, "n": n, "t": tokenize(n)})
+
+    officielle = _entite(db, "SEKOU TRAORE", avec_source=True)
+    alias(officielle, "SEKOU T")                 # 2 libellés au total
+    copie = _entite(db, "Sekou Traore")
+    alias(copie, "SEIKOU TRAORE")                # 2 aussi, mais AUTRE graphie
+    db.commit()
+
+    dedupe_entities.supprimer(db)
+    assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
+                      {"i": copie}).scalar() == 1
