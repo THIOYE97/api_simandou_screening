@@ -114,7 +114,10 @@ def fetch() -> List[SanctionEntity]:
         entities.append(
             SanctionEntity(
                 source="OFAC",
-                source_id=f"OFAC-{uid}",
+                # Convention alignée sur celle déjà en base : « OFAC-SDN-10000 ».
+                # Le numéro est identique, seul le préfixe différait — et
+                # cet écart aurait fait créer 19 169 doublons.
+                source_id=f"OFAC-SDN-{uid}",
                 entity_type=entity_type,
                 primary_name=primary_raw,
                 country_focus=country,

@@ -120,7 +120,9 @@ def fetch() -> List[SanctionEntity]:
         entities.append(
             SanctionEntity(
                 source="EU",
-                source_id=f"EU-{uid}",
+                # L'identifiant européen porte déjà son préfixe (« EU.1001.60 ») :
+                # le redoubler empêchait toute correspondance avec l'existant.
+                source_id=uid,
                 entity_type=entity_type,
                 primary_name=primary_raw,
                 country_focus=country,

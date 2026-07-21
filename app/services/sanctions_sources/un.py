@@ -26,7 +26,11 @@ def fetch() -> List[SanctionEntity]:
     entities: List[SanctionEntity] = []
 
     for individual in root.iter("INDIVIDUAL"):
-        uid = (individual.findtext("DATAID") or "").strip()
+        # La base emploie le numéro de référence permanent (« CDe.001 »), non
+        # le DATAID interne. Les deux figurent au XML ; c'est le premier qui
+        # identifie durablement une inscription.
+        uid = ((individual.findtext("REFERENCE_NUMBER") or "").strip()
+               or (individual.findtext("DATAID") or "").strip())
         first = (individual.findtext("FIRST_NAME") or "").strip()
         second = (individual.findtext("SECOND_NAME") or "").strip()
         third = (individual.findtext("THIRD_NAME") or "").strip()
@@ -47,7 +51,7 @@ def fetch() -> List[SanctionEntity]:
         entities.append(
             SanctionEntity(
                 source="UN",
-                source_id=f"UN-{uid}",
+                source_id=uid,
                 entity_type=EntityType.INDIVIDUAL,
                 primary_name=primary_raw,
                 country_focus=country,
@@ -57,7 +61,8 @@ def fetch() -> List[SanctionEntity]:
         )
 
     for entity in root.iter("ENTITY"):
-        uid = (entity.findtext("DATAID") or "").strip()
+        uid = ((entity.findtext("REFERENCE_NUMBER") or "").strip()
+               or (entity.findtext("DATAID") or "").strip())
         primary_raw = (entity.findtext("FIRST_NAME") or "").strip()
 
         if not primary_raw:
@@ -73,7 +78,7 @@ def fetch() -> List[SanctionEntity]:
         entities.append(
             SanctionEntity(
                 source="UN",
-                source_id=f"UN-{uid}",
+                source_id=uid,
                 entity_type=EntityType.ENTITY,
                 primary_name=primary_raw,
                 country_focus=country,
