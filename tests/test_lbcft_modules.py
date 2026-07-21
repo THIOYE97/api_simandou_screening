@@ -939,3 +939,102 @@ def test_refresh_simulation_n_ecrit_rien(db):
     assert sim["dry_run"] is True
     assert sim["would_create"] == 10
     assert compte() == avant          # rien n'a été écrit
+
+
+# ── Doublons laissés par l'ancien agent ───────────────────────────────────────
+#
+# L'agent écrivait dans `entities` sans alimenter `source_records`. Les deux
+# chargeurs ont donc créé les mêmes personnes en double. Le nettoyage ne doit
+# jamais toucher une entité citée par un dossier : un dossier LBC/FT doit rester
+# relisible tel qu'il se présentait à la décision.
+
+def _entite(db, nom: str, avec_source: bool = False, source_code: str = "T_DEDUP"):
+    import uuid as _uuid
+    from sqlalchemy import text
+    from app.services.matching import normalize_name, tokenize
+    eid = str(_uuid.uuid4())
+    db.execute(text("""
+        INSERT INTO entities (id, entity_type, primary_name, risk_level)
+        VALUES (CAST(:i AS uuid), 'person', :n, 'HIGH')
+    """), {"i": eid, "n": nom})
+    n = normalize_name(nom)
+    db.execute(text("""
+        INSERT INTO entity_names (entity_id, name_raw, name_normalized, name_tokens,
+                                  is_primary, name_type)
+        VALUES (CAST(:i AS uuid), :r, :n, :t, true, 'PRIMARY')
+    """), {"i": eid, "r": nom, "n": n, "t": tokenize(n)})
+    if avec_source:
+        sid = db.execute(text("SELECT id FROM sources WHERE source_code = :c"),
+                         {"c": source_code}).scalar()
+        if not sid:
+            sid = db.execute(text("""
+                INSERT INTO sources (source_code, source_name, source_type,
+                                     refresh_policy, is_active)
+                VALUES (:c, 'Test', 'SANCTIONS', 'MANUAL', true) RETURNING id
+            """), {"c": source_code}).scalar()
+        db.execute(text("""
+            INSERT INTO source_records (id, source_id, source_ref, entity_id, record_type)
+            VALUES (gen_random_uuid(), :s, :ref, CAST(:i AS uuid), 'SANCTION')
+        """), {"s": sid, "ref": eid[:12], "i": eid})
+    db.commit()
+    return eid
+
+
+@pytest.mark.integration
+def test_dedupe_supprime_le_doublon_orphelin(db):
+    from sqlalchemy import text
+    from app.scripts import dedupe_entities
+
+    officielle = _entite(db, "VLADIMIR POUTINE", avec_source=True)
+    orpheline = _entite(db, "Vladimir Poutine")          # même personne, casse différente
+
+    assert dedupe_entities.analyser(db)["candidats"] >= 1
+    dedupe_entities.supprimer(db)
+
+    reste = {str(r) for r in db.execute(text(
+        "SELECT id FROM entities WHERE UPPER(TRIM(primary_name)) = 'VLADIMIR POUTINE'"
+    )).scalars()}
+    assert officielle in reste          # la version rattachée à une source subsiste
+    assert orpheline not in reste
+
+
+@pytest.mark.integration
+def test_dedupe_epargne_une_entite_citee_par_un_dossier(db):
+    """Même orpheline et même en double, une entité référencée par une
+    correspondance historisée doit être conservée."""
+    from sqlalchemy import text
+    from app.scripts import dedupe_entities
+
+    _entite(db, "MAMADOU CITE", avec_source=True)
+    orpheline = _entite(db, "Mamadou Cite")
+
+    tid = _make_tenant(db)
+    rid = db.execute(text("""
+        INSERT INTO screening_requests (id, tenant_id, request_payload, provider, status)
+        VALUES (gen_random_uuid(), CAST(:t AS uuid), '{}'::jsonb, 'INTERNAL', 'DONE')
+        RETURNING id
+    """), {"t": tid}).scalar()
+    db.execute(text("""
+        INSERT INTO screening_matches (tenant_id, request_id, entity_id, match_score,
+                                       match_band, reasons)
+        VALUES (CAST(:t AS uuid), :r, CAST(:i AS uuid), 95, 'STRONG', '{}'::jsonb)
+    """), {"t": tid, "r": rid, "i": orpheline})
+    db.commit()
+
+    dedupe_entities.supprimer(db)
+    survit = db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
+                        {"i": orpheline}).scalar()
+    assert survit == 1
+
+
+@pytest.mark.integration
+def test_dedupe_epargne_une_entite_unique(db):
+    """Une entité sans source mais sans jumelle officielle n'est PAS un doublon :
+    la supprimer perdrait la seule trace de cette personne."""
+    from sqlalchemy import text
+    from app.scripts import dedupe_entities
+
+    seule = _entite(db, "PERSONNE SANS JUMELLE UNIQUE")
+    dedupe_entities.supprimer(db)
+    assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
+                      {"i": seule}).scalar() == 1
