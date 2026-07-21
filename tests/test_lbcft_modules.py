@@ -694,6 +694,35 @@ def test_offshore_sujet_absent_ne_renvoie_rien(db):
 
 
 @pytest.mark.integration
+def test_offshore_societe_enregistree_comme_actionnaire(db):
+    """Dans l'ICIJ, une société actionnaire d'une autre est enregistrée comme
+    OFFICER et non comme ENTITY. Chercher les sociétés parmi les seuls ENTITY
+    les faisait toutes manquer — « Petróleos de Venezuela » n'était pas
+    retrouvé. Le sens de lecture doit suivre la nature du nœud TROUVÉ."""
+    from sqlalchemy import text
+    from app.services import offshore_service as osvc
+    from app.services.matching import normalize_name
+
+    _seed_offshore(db)
+    # Société actionnaire : nœud OFFICER, portant une dénomination sociale.
+    db.execute(text("""
+        INSERT INTO offshore_records (node_id, kind, name, name_normalized)
+        VALUES ('c1', CAST('OFFICER' AS offshore_kind), :n, :nn)
+    """), {"n": "Ever Treasure Co Ltd", "nn": normalize_name("Ever Treasure Co Ltd")})
+    db.execute(text("""
+        INSERT INTO offshore_relations
+            (node_id_start, node_id_end, rel_type, role_raw, role_class, source)
+        VALUES ('c1', 'e1', 'officer_of', 'shareholder of', 'SHAREHOLDER', 'Panama Papers')
+    """))
+    db.commit()
+
+    r = osvc.linked_parties(db, "Ever Treasure Co Ltd", subject_is_company=True)
+    assert r["subject_found"] is True
+    # Lue comme actionnaire : ce sont les sociétés DÉTENUES qui remontent.
+    assert [p["name"] for p in r["parties"]] == ["Atlas Holdings Ltd"]
+
+
+@pytest.mark.integration
 def test_offshore_ne_confond_pas_les_natures(db):
     """Chercher une société parmi les personnes ne doit rien donner : sans ce
     garde-fou, un homonyme personne/société créerait un faux rattachement."""

@@ -322,23 +322,30 @@ def linked_parties(db: Session, name: str, subject_is_company: bool,
         return {"subject_found": False, "subject": None, "parties": []}
 
     db.execute(text("SET LOCAL pg_trgm.similarity_threshold = 0.55"))
-    # Le sujet est cherché parmi les nœuds de la nature attendue : une société
-    # se retrouve côté ENTITY, une personne côté OFFICER.
-    kind = "ENTITY" if subject_is_company else "OFFICER"
+    # Une personne ne peut être qu'un OFFICER. Une société, elle, apparaît
+    # SOIT comme société offshore (ENTITY), SOIT comme actionnaire d'une autre
+    # société — et l'ICIJ l'enregistre alors comme OFFICER. Restreindre les
+    # sociétés aux seuls ENTITY faisait manquer tous les actionnaires
+    # personnes morales : « Petróleos de Venezuela » n'était pas retrouvé.
+    kinds = ["ENTITY", "OFFICER", "INTERMEDIARY"] if subject_is_company else ["OFFICER"]
     subj = db.execute(text("""
-        SELECT node_id, name, jurisdiction, investigation, incorporation_date, status,
-               ROUND((similarity(name_normalized, :q) * 100)::numeric) AS score
+        SELECT node_id, name, kind::text AS kind, jurisdiction, investigation,
+               incorporation_date, status,
+               ROUND((similarity(name_normalized, :q) * 100)::numeric) AS score,
+               -- À ressemblance égale, une société est d'abord une société.
+               CASE WHEN kind = 'ENTITY' THEN 0 ELSE 1 END AS rang
           FROM offshore_records
-         WHERE kind = CAST(:k AS offshore_kind) AND name_normalized % :q
-         ORDER BY score DESC, name
+         WHERE kind = ANY(CAST(:k AS offshore_kind[])) AND name_normalized % :q
+         ORDER BY score DESC, rang, name
          LIMIT 1
-    """), {"q": q, "k": kind}).mappings().first()
+    """), {"q": q, "k": kinds}).mappings().first()
     if not subj:
         return {"subject_found": False, "subject": None, "parties": []}
 
-    # Le sens de lecture dépend de la nature du sujet : l'arête va toujours de
-    # la personne vers la société.
-    if subject_is_company:
+    # Le sens de lecture découle de la nature du nœud TROUVÉ, pas de celle du
+    # sujet : l'arête va toujours de l'acteur vers la société détenue. Un nœud
+    # ENTITY se lit donc « qui me détient », tout autre « que dois-je détenir ».
+    if subj["kind"] == "ENTITY":
         sql = """
             SELECT r.role_raw, r.role_class, r.source,
                    o.node_id, o.name, o.countries, o.jurisdiction, o.kind::text AS kind
