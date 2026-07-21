@@ -19,6 +19,7 @@ import csv
 import io
 import json
 import logging
+import time
 import zipfile
 from typing import Iterator, Optional
 
@@ -122,6 +123,7 @@ def ingest(db: Session, records: Iterator[dict]) -> dict[str, int]:
         if len(pending) >= BATCH:
             flush()
     flush()
+    invalidate_stats_cache()
     # « created » compte les lignes PRÉSENTÉES ; les doublons sont écartés
     # silencieusement par la contrainte d'unicité.
     return {"presented": created, "skipped": skipped, "read": read}
@@ -157,10 +159,27 @@ def search(db: Session, query: str, limit: int = 30, kind: Optional[str] = None)
     return [dict(r) | {"score": int(r["score"])} for r in rows]
 
 
+# Dénombrement mis en cache. Compter 1,6 million de lignes coûte 5 à 8 s :
+# Postgres n'a pas de compteur de lignes, il doit toutes les parcourir. Or ce
+# décompte est appelé à chaque ouverture de l'écran et ne bouge qu'à l'import.
+_STATS_TTL_S = 900
+_stats_cache: dict = {"at": 0.0, "value": None}
+
+
+def invalidate_stats_cache() -> None:
+    _stats_cache["value"] = None
+
+
 def stats(db: Session) -> dict:
+    now = time.monotonic()
+    cached = _stats_cache["value"]
+    if cached is not None and (now - _stats_cache["at"]) < _STATS_TTL_S:
+        return cached
     rows = db.execute(text(
         "SELECT kind::text AS kind, COUNT(*)::int AS n FROM offshore_records GROUP BY kind"
     )).mappings().all()
     by_kind = {r["kind"]: r["n"] for r in rows}
-    return {"total": sum(by_kind.values()), "by_kind": by_kind,
-            "attribution": ICIJ_ATTRIBUTION}
+    value = {"total": sum(by_kind.values()), "by_kind": by_kind,
+             "attribution": ICIJ_ATTRIBUTION}
+    _stats_cache.update(at=now, value=value)
+    return value
