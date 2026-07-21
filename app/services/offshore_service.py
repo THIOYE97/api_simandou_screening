@@ -135,12 +135,18 @@ def search(db: Session, query: str, limit: int = 30, kind: Optional[str] = None)
     q = normalize_name(query or "")
     if len(q) < 3:
         return []
+    # L'opérateur « % » de pg_trgm est le SEUL à exploiter l'index GIN ;
+    # « similarity(...) > seuil » dans le WHERE impose un balayage complet.
+    # Le seuil se règle donc par variable de session, pas dans la condition.
+    # Pas de doublement du « % » : psycopg3 lie les paramètres côté serveur
+    # ($1) et transmet la requête telle quelle, sans interpolation.
+    db.execute(text("SET LOCAL pg_trgm.similarity_threshold = 0.35"))
     sql = """
         SELECT node_id, kind::text AS kind, name, countries, jurisdiction,
                investigation, incorporation_date, status,
                ROUND((similarity(name_normalized, :q) * 100)::numeric) AS score
         FROM offshore_records
-        WHERE similarity(name_normalized, :q) > 0.35
+        WHERE name_normalized % :q
     """
     params: dict = {"q": q, "lim": limit}
     if kind:
