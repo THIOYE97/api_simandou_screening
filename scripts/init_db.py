@@ -28,6 +28,19 @@ from sqlalchemy import create_engine, text
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "db" / "baseline_schema.sql"
 
+# Révision Alembic que représente le schéma canonique. Déterminée par
+# comparaison : le schéma contient `compliance_events` (m6b) mais l'énumération
+# `alert_status` y porte encore ses anciennes valeurs, donc il précède m6d.
+# À mettre à jour si le fichier db/baseline_schema.sql est régénéré.
+BASELINE_REVISION = "m6b_compliance_audit"
+
+# Tables introduites par des migrations POSTÉRIEURES au schéma canonique. Leur
+# présence atteste que la montée de version a bien eu lieu.
+POST_BASELINE_TABLES = (
+    "ubo_declarations", "ubo_documents", "offshore_records",
+    "offshore_relations", "press_search_cache",
+)
+
 APP_ROLE = "screening_app"
 BYPASS_ROLE = "auth_bypass_rls"
 
@@ -107,11 +120,39 @@ def main() -> int:
                         print(f"⚠ échec sur : {s[:80]}…\n  {str(e)[:160]}", file=sys.stderr)
         print(f"✓ schéma appliqué ({len(stmts)} instructions)")
 
-    # 3) alembic stamp head -------------------------------------------------
+    # 3) calage Alembic puis montée jusqu'à la tête -------------------------
+    #
+    # On cale sur la révision que REPRÉSENTE le schéma canonique, puis on
+    # applique les migrations suivantes. Caler directement sur la tête
+    # déclarerait appliquées des migrations dont les tables n'existent pas :
+    # une base neuve démarrerait alors sans `ubo_declarations`,
+    # `offshore_records`, `offshore_relations` ni `press_search_cache`, et
+    # Alembic la dirait à jour. L'anomalie ne se verrait qu'à l'usage.
     env = {**os.environ, "DATABASE_URL": url}
-    r = subprocess.run([sys.executable, "-m", "alembic", "stamp", "head"], env=env,
-                       cwd=str(ROOT), capture_output=True, text=True)
-    print("✓ alembic stamp head" if r.returncode == 0 else f"⚠ alembic stamp: {r.stderr[-200:]}")
+
+    def _alembic(*args) -> bool:
+        r = subprocess.run([sys.executable, "-m", "alembic", *args], env=env,
+                           cwd=str(ROOT), capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"⚠ alembic {' '.join(args)} : {r.stderr[-300:]}", file=sys.stderr)
+        return r.returncode == 0
+
+    if _alembic("stamp", BASELINE_REVISION):
+        print(f"✓ alembic stamp {BASELINE_REVISION}")
+    if _alembic("upgrade", "head"):
+        print("✓ alembic upgrade head")
+
+    # Contrôle : les tables introduites APRÈS le schéma canonique doivent
+    # exister. Sans ce garde-fou, une base incomplète se présenterait comme
+    # saine — c'est précisément ce qui rendait toute reconstruction illusoire.
+    with eng.begin() as c:
+        manquantes = [t for t in POST_BASELINE_TABLES if not c.execute(text(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_name=:t"), {"t": t}).scalar()]
+    if manquantes:
+        print(f"✗ tables absentes après migration : {', '.join(manquantes)}", file=sys.stderr)
+        return 1
+    print("✓ schéma complet vérifié")
 
     # 4) seed référentiel + admin ------------------------------------------
     from app.core.config import settings
