@@ -102,6 +102,20 @@ def lookup_declaration(
     }
 
 
+@router.get("/ownership")
+def company_ownership(company_name: str = Query(...), db=Depends(get_db)):
+    """
+    Détention capitalistique connue d'une société (référentiel LEI/GLEIF).
+
+    À NE PAS CONFONDRE avec le registre interne : ici on expose ce que le
+    référentiel public sait de la chaîne entre PERSONNES MORALES, jamais la
+    personne physique finale. C'est un éclairage sur une société rapprochée
+    d'une liste, pas une déclaration de bénéficiaires effectifs.
+    """
+    from app.services import gleif_service
+    return gleif_service.ownership(company_name)
+
+
 @router.get("/declarations/{declaration_id}")
 def get_declaration(declaration_id: UUID, db=Depends(get_db)):
     decl = svc.get_declaration(db, declaration_id)
