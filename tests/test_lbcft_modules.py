@@ -1091,3 +1091,28 @@ def test_dedupe_epargne_une_copie_aux_graphies_differentes(db):
     dedupe_entities.supprimer(db)
     assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
                       {"i": copie}).scalar() == 1
+
+
+@pytest.mark.integration
+def test_dedupe_compare_les_graphies_sans_tenir_compte_de_la_casse(db):
+    """L'ancien agent normalisait en minuscules, le moteur d'ingestion en
+    majuscules. Comparer sans neutraliser la casse rendait le critère vrai par
+    construction : AUCUN doublon n'était jamais détecté, alors que les noms
+    bruts étaient identiques."""
+    from sqlalchemy import text
+    from app.scripts import dedupe_entities
+    from app.services.matching import tokenize
+
+    officielle = _entite(db, "IBRAHIMA SOW", avec_source=True)
+    copie = _entite(db, "Ibrahima Sow")
+    # On rejoue l'écart : la copie porte la graphie en minuscules.
+    db.execute(text("UPDATE entity_names SET name_normalized = LOWER(name_normalized) "
+                    "WHERE entity_id = CAST(:i AS uuid)"), {"i": copie})
+    db.commit()
+
+    assert dedupe_entities.analyser(db)["candidats"] >= 1
+    dedupe_entities.supprimer(db)
+    assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
+                      {"i": copie}).scalar() == 0
+    assert db.execute(text("SELECT COUNT(*) FROM entities WHERE id = CAST(:i AS uuid)"),
+                      {"i": officielle}).scalar() == 1

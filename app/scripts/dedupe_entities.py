@@ -69,12 +69,16 @@ WITH orphelines AS (
       FROM entities e
      WHERE NOT ({ref})
 ),
--- Libellés portés par chaque entité, sous forme d'ensemble normalisé.
+-- Libellés portés par chaque entité, sous forme d'ensemble.
+-- La casse est neutralisée : l'ancien agent normalisait en minuscules, le
+-- moteur d'ingestion en majuscules. Comparer sans en tenir compte revenait à
+-- ne jamais rien trouver — le critère était vrai par construction, donc vide
+-- de sens. (Le rapprochement, lui, n'en souffre pas : pg_trgm ignore la casse.)
 -- Compter ne suffit pas : deux copies peuvent porter autant de libellés tout
 -- en couvrant des graphies différentes. Seule l'INCLUSION garantit qu'aucune
 -- graphie ne disparaît.
 libelles AS (
-    SELECT entity_id, ARRAY_AGG(DISTINCT name_normalized) AS jeu
+    SELECT entity_id, ARRAY_AGG(DISTINCT UPPER(name_normalized)) AS jeu
       FROM entity_names GROUP BY entity_id
 ),
 officielles AS (
@@ -119,7 +123,7 @@ def analyser(db) -> dict:
     # version rattachée à une source.
     plus_riches = db.execute(text(f"""
         WITH libelles AS (
-            SELECT entity_id, ARRAY_AGG(DISTINCT name_normalized) AS jeu
+            SELECT entity_id, ARRAY_AGG(DISTINCT UPPER(name_normalized)) AS jeu
               FROM entity_names GROUP BY entity_id
         ),
         orph AS (
