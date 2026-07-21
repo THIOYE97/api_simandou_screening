@@ -195,15 +195,25 @@ _GDELT_THEMES = (
     "OR theme:SCANDAL OR theme:ARREST"
 )
 
-# GDELT impose une requête toutes les 5 s et répond 429 au-delà. Un verrou de
-# processus espace les appels ; le cache évite de la solliciter deux fois pour
-# la même société.
-_GDELT_MIN_INTERVAL_S = 5.5
+# GDELT annonce « une requête toutes les 5 s », mais la mesure contredit cette
+# lecture : espacés de 30 s depuis une seule adresse IP, 11 appels n'ont abouti
+# que 4 fois (36 %), et les succès ne suivent aucun rythme régulier. Le quota
+# est donc global, pas fonction de l'intervalle — espacer davantage ne sert à
+# rien, seule la RELANCE rattrape les refus.
+#
+# Conséquence assumée : la recherche de presse n'est pas fiable à 100 %. Elle
+# reste un appoint informatif, jamais un élément de décision — et le cache fait
+# qu'une société interrogée une fois répond ensuite instantanément.
+_GDELT_MIN_INTERVAL_S = 2.0
+_GDELT_ATTEMPTS = 3
+_GDELT_RETRY_WAIT_S = 7.0
 _gdelt_lock = threading.Lock()
 _gdelt_last_call = [0.0]
 
-_PRESS_TTL_S = 6 * 3600
-_press_cache: dict[str, tuple[float, list[dict]]] = {}
+_PRESS_TTL_H = 6
+# Au-delà, une recherche restée « en cours » est tenue pour perdue (worker
+# redémarré en plein vol) et peut être relancée.
+_PRESS_STALE_MIN = 5
 
 
 def _gdelt_query(name: str, months: int) -> list[dict]:
@@ -226,35 +236,118 @@ def _gdelt_query(name: str, months: int) -> list[dict]:
     return json.loads(raw).get("articles") or []
 
 
-def search_press(name: str, months: int = 24) -> dict:
+def press_status(db: Session, name: str) -> dict:
     """
-    Pistes de presse pour une dénomination sociale.
+    État de la recherche de presse pour une dénomination.
 
-    Ne lève jamais : la presse est un appoint, son indisponibilité ne doit pas
-    faire échouer une vérification.
+    Ne déclenche rien : c'est ce que sonde l'écran. Renvoie toujours un statut
+    exploitable — IDLE (jamais cherché), PENDING, DONE ou ERROR.
     """
-    key = f"{normalize_name(name)}|{months}"
-    hit = _press_cache.get(key)
-    if hit and (time.monotonic() - hit[0]) < _PRESS_TTL_S:
-        return {"name": name, "articles": hit[1], "attribution": GDELT_ATTRIBUTION,
-                "cached": True, "error": None}
+    key = normalize_name(name or "")[:300]
+    row = db.execute(text("""
+        SELECT status, articles, error,
+               EXTRACT(EPOCH FROM (now() - updated_at)) / 3600 AS age_h,
+               EXTRACT(EPOCH FROM (now() - started_at)) / 60   AS run_min
+          FROM press_search_cache WHERE name_normalized = :k
+    """), {"k": key}).mappings().first()
+
+    if not row:
+        return {"status": "IDLE", "articles": [], "error": None,
+                "attribution": GDELT_ATTRIBUTION}
+
+    # Recherche en cours depuis trop longtemps : le worker qui la portait a
+    # sans doute disparu. On la déclare perdue plutôt que de faire tourner
+    # l'écran indéfiniment.
+    if row["status"] == "PENDING" and float(row["run_min"] or 0) > _PRESS_STALE_MIN:
+        return {"status": "IDLE", "articles": [], "error": None,
+                "attribution": GDELT_ATTRIBUTION}
+
+    if row["status"] == "DONE" and float(row["age_h"] or 0) > _PRESS_TTL_H:
+        return {"status": "IDLE", "articles": [], "error": None,
+                "attribution": GDELT_ATTRIBUTION}
+
+    return {"status": row["status"], "articles": row["articles"] or [],
+            "error": row["error"], "attribution": GDELT_ATTRIBUTION}
+
+
+def press_start(db: Session, name: str) -> dict:
+    """
+    Déclenche une recherche en arrière-plan si nécessaire, et rend la main
+    aussitôt. La source refuse environ deux requêtes sur trois et chaque
+    tentative peut durer une minute : faire patienter l'appel HTTP jusqu'au
+    bout donnerait un écran figé pour, souvent, un échec.
+    """
+    current = press_status(db, name)
+    if current["status"] in ("DONE", "PENDING", "ERROR"):
+        return current
+
+    key = normalize_name(name or "")[:300]
+    db.execute(text("""
+        INSERT INTO press_search_cache
+            (name_normalized, display_name, status, articles, error, started_at, updated_at)
+        VALUES (:k, :n, 'PENDING', NULL, NULL, now(), now())
+        ON CONFLICT (name_normalized) DO UPDATE
+           SET status = 'PENDING', articles = NULL, error = NULL,
+               started_at = now(), updated_at = now()
+    """), {"k": key, "n": (name or "")[:300]})
+    db.commit()
+
+    threading.Thread(target=_press_worker, args=(key, name), daemon=True).start()
+    return {"status": "PENDING", "articles": [], "error": None,
+            "attribution": GDELT_ATTRIBUTION}
+
+
+def _press_worker(key: str, name: str) -> None:
+    """
+    Interroge la source hors du cycle de la requête HTTP.
+
+    Ouvre sa PROPRE session : celle de la requête est refermée bien avant que
+    ce fil ne se termine.
+    """
+    from app.core.db import SessionLocal
+
+    articles: list[dict] = []
+    err = None
     try:
-        arts = _gdelt_query(name, months)
-    except Exception as e:
-        logger.warning("gdelt_unavailable", extra={"reason": str(e)[:200]})
-        return {"name": name, "articles": [], "attribution": GDELT_ATTRIBUTION,
-                "cached": False, "error": "Source de presse momentanément indisponible."}
+        arts = None
+        last = ""
+        for attempt in range(_GDELT_ATTEMPTS):
+            try:
+                arts = _gdelt_query(name, 24)
+                break
+            except Exception as e:
+                last = str(e)[:200]
+                if attempt < _GDELT_ATTEMPTS - 1:
+                    time.sleep(_GDELT_RETRY_WAIT_S)
+        if arts is None:
+            err = "La source de presse limite ses requêtes ; réessayez dans un instant."
+            logger.warning("gdelt_unavailable", extra={"reason": last})
+        else:
+            articles = [{
+                "title": (a.get("title") or "").strip(),
+                "url": a.get("url"),
+                "domain": a.get("domain"),
+                "language": a.get("language"),
+                "seen_at": (a.get("seendate") or "")[:8],
+            } for a in arts if (a.get("title") or "").strip()]
+    except Exception as e:  # défaillance inattendue : l'écran ne doit pas tourner sans fin
+        err = "Recherche de presse interrompue."
+        logger.exception("press_worker_failed", extra={"reason": str(e)[:200]})
 
-    out = [{
-        "title": (a.get("title") or "").strip(),
-        "url": a.get("url"),
-        "domain": a.get("domain"),
-        "language": a.get("language"),
-        "seen_at": (a.get("seendate") or "")[:8],
-    } for a in arts if (a.get("title") or "").strip()]
-    _press_cache[key] = (time.monotonic(), out)
-    return {"name": name, "articles": out, "attribution": GDELT_ATTRIBUTION,
-            "cached": False, "error": None}
+    db = SessionLocal()
+    try:
+        db.execute(text("""
+            UPDATE press_search_cache
+               SET status = :st, articles = CAST(:a AS jsonb), error = :e, updated_at = now()
+             WHERE name_normalized = :k
+        """), {"st": "ERROR" if err else "DONE",
+               "a": json.dumps(articles, ensure_ascii=False),
+               "e": err, "k": key})
+        db.commit()
+    except Exception:
+        logger.exception("press_cache_write_failed")
+    finally:
+        db.close()
 
 
 def assess_company(db: Session, name: str) -> dict:

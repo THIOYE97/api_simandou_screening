@@ -26,16 +26,23 @@ def screen(payload: ScreenRequest, db=Depends(get_db)):
 
 
 @router.get("/press")
-def press(name: str = Query(min_length=3, max_length=200),
-          months: int = Query(24, ge=1, le=60)):
+def press_status(name: str = Query(min_length=3, max_length=200), db=Depends(get_db)):
     """
-    Pistes de presse pour une dénomination sociale (source libre GDELT).
+    État de la recherche de presse : sondé par l'écran, ne déclenche rien.
+    """
+    return svc.press_status(db, name)
 
-    Consultée à la demande depuis l'écran, et non pendant la vérification : la
-    source impose une requête toutes les 5 secondes et un appel systématique
-    soumettrait chaque vérification à sa disponibilité.
+
+@router.post("/press")
+def press_start(name: str = Query(min_length=3, max_length=200), db=Depends(get_db)):
     """
-    return svc.search_press(name, months=months)
+    Déclenche la recherche et rend la main aussitôt.
+
+    Mesuré : la source refuse environ deux requêtes sur trois et chaque
+    tentative dure de 14 à 57 secondes. Attendre le résultat dans la requête
+    HTTP figerait l'écran près d'une minute pour, souvent, un échec.
+    """
+    return svc.press_start(db, name)
 
 
 @router.get("/records", response_model=list[RecordOut])

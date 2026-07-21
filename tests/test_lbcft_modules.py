@@ -542,3 +542,76 @@ def test_adverse_media_ne_sapplique_pas_aux_personnes_physiques(db):
     r = eng.run_simple_screening(db=db, name="Boreal Shipping Ltd",
                                  meta={"entity_type": "INDIVIDUAL"})
     assert r["risk_level"] == "LOW" and r["recommended_action"] == "PASS"
+
+
+# ── Recherche de presse asynchrone ────────────────────────────────────────────
+#
+# Seule la logique de cache est testée : l'appel à la source externe est
+# volontairement hors tests, car il échoue environ deux fois sur trois et
+# rendrait la suite instable.
+
+def _press_row(db, name_norm: str, status: str, started_ago: str,
+               updated_ago: str, articles: str = "null"):
+    from sqlalchemy import text
+    db.execute(text(f"""
+        INSERT INTO press_search_cache
+            (name_normalized, display_name, status, articles, started_at, updated_at)
+        VALUES (:k, :k, :s, CAST(:a AS jsonb),
+                now() - interval '{started_ago}', now() - interval '{updated_ago}')
+        ON CONFLICT (name_normalized) DO UPDATE
+           SET status = EXCLUDED.status, articles = EXCLUDED.articles,
+               started_at = EXCLUDED.started_at, updated_at = EXCLUDED.updated_at
+    """), {"k": name_norm, "s": status, "a": articles})
+    db.commit()
+
+
+@pytest.mark.integration
+def test_press_jamais_cherche_est_inactif(db):
+    from app.services import adverse_media_service as ams
+    assert ams.press_status(db, "Societe Jamais Vue")["status"] == "IDLE"
+
+
+@pytest.mark.integration
+def test_press_resultat_en_cache_est_servi(db):
+    from app.services import adverse_media_service as ams
+    _press_row(db, "SOCIETE CACHEE", "DONE", "1 hour", "1 hour",
+               '[{"title": "article"}]')
+    r = ams.press_status(db, "Societe Cachee")
+    assert r["status"] == "DONE" and len(r["articles"]) == 1
+
+
+@pytest.mark.integration
+def test_press_recherche_perdue_ne_bloque_pas_l_ecran(db):
+    """Un worker redémarré en plein vol laisse une recherche « en cours » qui
+    ne se terminera jamais. Sans garde-fou, l'écran tournerait sans fin."""
+    from app.services import adverse_media_service as ams
+    _press_row(db, "SOCIETE PERDUE", "PENDING", "20 minutes", "20 minutes")
+    assert ams.press_status(db, "Societe Perdue")["status"] == "IDLE"
+
+    # Une recherche récente, elle, doit rester signalée comme en cours.
+    _press_row(db, "SOCIETE RECENTE", "PENDING", "10 seconds", "10 seconds")
+    assert ams.press_status(db, "Societe Recente")["status"] == "PENDING"
+
+
+@pytest.mark.integration
+def test_press_resultat_perime_est_recherche_a_nouveau(db):
+    from app.services import adverse_media_service as ams
+    _press_row(db, "SOCIETE ANCIENNE", "DONE", "9 hours", "9 hours",
+               '[{"title": "vieux"}]')
+    assert ams.press_status(db, "Societe Ancienne")["status"] == "IDLE"
+
+
+@pytest.mark.integration
+def test_press_le_cache_est_partage_et_non_en_memoire(db):
+    """La production tourne avec deux workers : le sondage peut atteindre un
+    autre processus que celui qui a lancé la recherche. Le cache doit donc
+    vivre en base — une session neuve doit voir le résultat."""
+    from sqlalchemy import text
+    from app.services import adverse_media_service as ams
+    _press_row(db, "SOCIETE PARTAGEE", "DONE", "1 hour", "1 hour",
+               '[{"title": "article"}]')
+    n = db.execute(text(
+        "SELECT COUNT(*) FROM press_search_cache WHERE name_normalized = 'SOCIETE PARTAGEE'"
+    )).scalar()
+    assert n == 1
+    assert ams.press_status(db, "Societe Partagee")["status"] == "DONE"
