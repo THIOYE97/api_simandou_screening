@@ -184,6 +184,17 @@ def retrieve_candidates(
         FROM entity_names en
         JOIN entities e ON e.id = en.entity_id
         WHERE en.name_normalized % :q
+          -- Une personne retirée d'une liste ne doit plus être signalée. Sans
+          -- cette exclusion, une levée de sanction n'aurait aucun effet et
+          -- l'entité resterait rapprochée indéfiniment.
+          -- L'entité est écartée seulement si TOUTES ses inscriptions sont
+          -- radiées : une même personne peut figurer sur plusieurs listes et
+          -- n'être retirée que de l'une d'elles.
+          AND NOT EXISTS (
+              SELECT 1 FROM source_records sr
+               WHERE sr.entity_id = e.id
+              HAVING bool_and(sr.unlisted_on IS NOT NULL)
+          )
         ORDER BY sim DESC
         LIMIT :lim
         """

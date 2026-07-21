@@ -730,3 +730,158 @@ def test_offshore_ne_confond_pas_les_natures(db):
     _seed_offshore(db)
     assert osvc.linked_parties(db, "Atlas Holdings Ltd",
                                subject_is_company=False)["subject_found"] is False
+
+
+# ── Rafraîchissement des listes ───────────────────────────────────────────────
+#
+# L'ancien agent purgeait puis rechargeait chaque source. Cette stratégie
+# échouait dès qu'une vérification avait rapproché une entité, et réattribuait
+# de nouveaux identifiants à chaque exécution. On fusionne désormais, et l'on
+# radie au lieu de supprimer.
+
+def _flux(n: int, prefixe: str = "CIBLE"):
+    # Le nom porte le préfixe de la source : sans cela, les entités homonymes
+    # créées par un autre test resteraient actives et masqueraient la radiation.
+    return [{"source_ref": f"REF-{i}", "primary_name": f"{prefixe} NUMERO {i}",
+             "entity_type": "person", "aliases": []}
+            for i in range(n)]
+
+
+@pytest.mark.integration
+def test_refresh_cree_puis_reste_idempotent(db):
+    from app.services import list_refresh
+    r1 = list_refresh.refresh_source(db, source_code="T_IDEM", source_name="Test",
+                                     records=iter(_flux(20)))
+    assert r1["created"] == 20 and r1["delisted"] == 0
+
+    r2 = list_refresh.refresh_source(db, source_code="T_IDEM", source_name="Test",
+                                     records=iter(_flux(20)))
+    assert r2["created"] == 0 and r2["unchanged"] == 20 and r2["delisted"] == 0
+
+
+@pytest.mark.integration
+def test_refresh_radie_sans_supprimer(db):
+    """Une personne retirée d'une liste est radiée, jamais effacée : c'est une
+    information de conformité, et la supprimer briserait les dossiers déjà
+    décidés qui la référencent."""
+    from sqlalchemy import text
+    from app.services import list_refresh
+
+    list_refresh.refresh_source(db, source_code="T_RAD", source_name="Test",
+                                records=iter(_flux(20)))
+    r = list_refresh.refresh_source(db, source_code="T_RAD", source_name="Test",
+                                    records=iter(_flux(18)))
+    assert r["delisted"] == 2
+
+    # Les lignes existent toujours, simplement datées de leur radiation.
+    total, radiees = db.execute(text("""
+        SELECT COUNT(*), COUNT(unlisted_on)
+          FROM source_records sr
+          JOIN sources s ON s.id = sr.source_id
+         WHERE s.source_code = 'T_RAD'
+    """)).first()
+    assert total == 20 and radiees == 2
+
+
+@pytest.mark.integration
+def test_refresh_suspend_la_radiation_si_le_flux_est_incomplet(db):
+    """Fichier tronqué, portail en panne, format changé : radier tout ce qui
+    manque viderait la liste de sanctions. Le garde-fou prime."""
+    from app.services import list_refresh
+
+    list_refresh.refresh_source(db, source_code="T_GARDE", source_name="Test",
+                                records=iter(_flux(100)))
+    r = list_refresh.refresh_source(db, source_code="T_GARDE", source_name="Test",
+                                    records=iter(_flux(10)))
+    assert r["delisting_skipped"] is True
+    assert r["delisted"] == 0
+
+
+@pytest.mark.integration
+def test_refresh_reinscrit_une_entite_radiee(db):
+    from app.services import list_refresh
+
+    list_refresh.refresh_source(db, source_code="T_REINS", source_name="Test",
+                                records=iter(_flux(20)))
+    list_refresh.refresh_source(db, source_code="T_REINS", source_name="Test",
+                                records=iter(_flux(18)))
+    r = list_refresh.refresh_source(db, source_code="T_REINS", source_name="Test",
+                                    records=iter(_flux(20)))
+    assert r["relisted"] == 2 and r["created"] == 0
+
+
+@pytest.mark.integration
+def test_refresh_conserve_l_identifiant_de_l_entite(db):
+    """Le cœur du correctif : l'identifiant ne change pas d'un run à l'autre.
+    L'ancien agent en réattribuait de nouveaux, détachant les correspondances
+    déjà historisées des entités qu'elles désignaient."""
+    from sqlalchemy import text
+    from app.services import list_refresh
+
+    def ids():
+        return {r[0]: str(r[1]) for r in db.execute(text("""
+            SELECT sr.source_ref, sr.entity_id
+              FROM source_records sr JOIN sources s ON s.id = sr.source_id
+             WHERE s.source_code = 'T_STABLE'
+        """))}
+
+    list_refresh.refresh_source(db, source_code="T_STABLE", source_name="Test",
+                                records=iter(_flux(10)))
+    avant = ids()
+    list_refresh.refresh_source(db, source_code="T_STABLE", source_name="Test",
+                                records=iter(_flux(10)))
+    assert ids() == avant
+
+
+@pytest.mark.integration
+def test_filtrage_exclut_les_entites_radiees(db):
+    """Sans cette exclusion, une levée de sanction n'aurait aucun effet :
+    l'entité resterait rapprochée indéfiniment."""
+    from sqlalchemy import text
+    from app.services import list_refresh
+    from app.services.matching import normalize_name, retrieve_candidates, tokenize
+
+    list_refresh.refresh_source(db, source_code="T_FILTRE", source_name="Test",
+                                records=iter(_flux(20, "RADIABLE")))
+    cible = "RADIABLE NUMERO 19"
+    q = normalize_name(cible)
+    assert any(c.primary_name == cible
+               for c in retrieve_candidates(db, q, tokenize(q), limit=30))
+
+    # Retirée du flux → radiée → ne doit plus être rapprochée.
+    list_refresh.refresh_source(db, source_code="T_FILTRE", source_name="Test",
+                                records=iter(_flux(19, "RADIABLE")))
+    assert not any(c.primary_name == cible
+                   for c in retrieve_candidates(db, q, tokenize(q), limit=30))
+
+
+@pytest.mark.integration
+def test_refiltrage_du_portefeuille_apres_mise_a_jour(db):
+    """Exigence TDR : un client déjà en relation qui apparaît sur une liste
+    doit déclencher une alerte, sans qu'un analyste l'ait demandé."""
+    from sqlalchemy import text
+    from app.services import list_refresh, list_rescreen
+    from app.services.matching import normalize_name
+
+    tid = _make_tenant(db)
+    nom = "MAMADOU OURY BARRY"
+    db.execute(text("""
+        INSERT INTO screening_requests (id, tenant_id, request_payload, provider, status)
+        VALUES (gen_random_uuid(), CAST(:t AS uuid), CAST(:p AS jsonb), 'INTERNAL', 'DONE')
+    """), {"t": tid, "p": '{"name": "%s", "name_normalized": "%s"}'
+                          % (nom, normalize_name(nom))})
+    db.commit()
+
+    r = list_refresh.refresh_source(
+        db, source_code="T_RESCREEN", source_name="Test",
+        records=iter([{"source_ref": "X1", "primary_name": nom,
+                       "entity_type": "person", "aliases": []}]))
+
+    out = list_rescreen.rescreen_for_entities(db, r["new_entity_ids"],
+                                              source_code="T_RESCREEN")
+    assert out["alerts"] == 1
+
+    # Relancer ne doit pas empiler les alertes.
+    out2 = list_rescreen.rescreen_for_entities(db, r["new_entity_ids"],
+                                               source_code="T_RESCREEN")
+    assert out2["alerts"] == 0

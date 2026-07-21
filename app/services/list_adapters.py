@@ -606,7 +606,79 @@ def fetch_guinea_jo(year: int = 2026, edition: int = 1) -> Iterator[dict]:
 # --------------------------------------------------------------------------
 # Registre des adaptateurs
 # --------------------------------------------------------------------------
+# ─── ONU / OFAC / UE ──────────────────────────────────────────────────────────
+#
+# Ces trois listes étaient alimentées par un agent autonome dont la stratégie
+# — purge puis rechargement — échouait dès qu'une vérification avait rapproché
+# une entité (contrainte screening_matches_entity_id_fkey). Les analyseurs sont
+# repris tels quels, éprouvés sur les XML réels ; seul le chargement change.
+
+UN_SOURCE_CODE = "UN"
+OFAC_SOURCE_CODE = "OFAC"
+EU_SOURCE_CODE = "EU"
+
+
+def _sanction_entities_to_records(entities) -> Iterator[dict]:
+    """Convertit les objets des analyseurs au format du moteur d'ingestion."""
+    for e in entities:
+        etype = "person" if str(getattr(e.entity_type, "value", e.entity_type)) == "individual" else "company"
+        primary = (e.primary_name or "").strip()
+        if not primary:
+            continue
+        aliases = [n.name_raw for n in (e.names or [])
+                   if not n.is_primary and (n.name_raw or "").strip()]
+        yield {
+            # L'identifiant d'origine porte l'idempotence ET la mise à jour :
+            # c'est lui qui permet de retrouver une entité d'un run à l'autre
+            # au lieu de la recréer sous un nouvel identifiant.
+            "source_ref": str(e.source_id),
+            "primary_name": primary,
+            "entity_type": etype,
+            "country": e.country_focus,
+            "aliases": aliases,
+            "program": ", ".join(e.programs or [])[:255] or None,
+            "summary": (e.remarks or None),
+            "raw": {"programs": e.programs or [], "source": e.source},
+        }
+
+
+def fetch_un_sanctions() -> Iterator[dict]:
+    from app.services.sanctions_sources import un
+    yield from _sanction_entities_to_records(un.fetch())
+
+
+def fetch_ofac_sanctions() -> Iterator[dict]:
+    from app.services.sanctions_sources import ofac
+    yield from _sanction_entities_to_records(ofac.fetch())
+
+
+def fetch_eu_sanctions() -> Iterator[dict]:
+    from app.services.sanctions_sources import eu
+    yield from _sanction_entities_to_records(eu.fetch())
+
+
 ADAPTERS: dict[str, dict] = {
+    UN_SOURCE_CODE: {
+        "name": "Nations Unies — Liste consolidée du Conseil de sécurité",
+        "fetch": fetch_un_sanctions,
+        "record_type": "SANCTION",
+        "url": "https://scsanctions.un.org/resources/xml/en/consolidated.xml",
+        "label": "ONU — Liste consolidée",
+    },
+    OFAC_SOURCE_CODE: {
+        "name": "États-Unis — OFAC, Specially Designated Nationals",
+        "fetch": fetch_ofac_sanctions,
+        "record_type": "SANCTION",
+        "url": "https://www.treasury.gov/ofac/downloads/sdn.xml",
+        "label": "États-Unis — OFAC SDN",
+    },
+    EU_SOURCE_CODE: {
+        "name": "Union européenne — Liste consolidée des sanctions financières",
+        "fetch": fetch_eu_sanctions,
+        "record_type": "SANCTION",
+        "url": "https://webgate.ec.europa.eu/fsd/fsf/public/files/xmlFullSanctionsList_1_1/content?token=dG9rZW4tMjAxNw",
+        "label": "Union européenne — FSF",
+    },
     UK_SOURCE_CODE: {
         "name": UK_SOURCE_NAME,
         "fetch": fetch_uk_sanctions,

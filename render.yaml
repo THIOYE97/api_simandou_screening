@@ -88,3 +88,36 @@ services:
       #   sync: false
       # - key: SEED_ANALYST_PASSWORD
       #   sync: false
+
+  # ── Rafraîchissement quotidien des listes ─────────────────────────────────
+  # Remplace l'agent autonome « sanctions_agent », dont la stratégie de purge
+  # échouait dès qu'une vérification avait rapproché une entité
+  # (screening_matches_entity_id_fkey), et qui ne couvrait que trois sources
+  # sur huit.
+  #
+  # Service distinct et non fil d'exécution dans le serveur web : rafraîchir
+  # six sources prend plusieurs minutes et consomme de la mémoire à analyser
+  # les XML. Dans un worker gunicorn, cela monopoliserait un créneau de requête
+  # sur deux et pourrait faire tomber l'API — l'API s'arrêterait parce qu'une
+  # liste se met à jour.
+  - type: cron
+    name: refresh-listes-lbcft
+    runtime: python
+    plan: starter
+    region: frankfurt
+    branch: main
+    # 05:00 UTC : l'OFAC publie ses mises à jour en fin de journée américaine.
+    schedule: "0 5 * * *"
+    buildCommand: ./build.sh
+    startCommand: python -m app.scripts.refresh_lists
+    envVars:
+      - key: ENVIRONMENT
+        value: staging
+      - key: DATABASE_URL
+        sync: false
+      - key: AUTH_BYPASS_ROLE
+        value: auth_bypass_rls
+      - key: SECRET_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
