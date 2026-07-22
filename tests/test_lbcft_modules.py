@@ -505,7 +505,6 @@ def _make_tenant(db) -> str:
 def test_adverse_media_releve_le_risque_sans_jamais_bloquer(db):
     """Effet sur la vérification d'une personne morale, mesuré en isolant le
     signalement : le même nom doit passer de LOW/PASS à un examen imposé."""
-    from sqlalchemy import text
     from app.core.db import set_tenant_context
     from app.services import simple_screening_engine as eng
 
@@ -531,7 +530,6 @@ def test_adverse_media_releve_le_risque_sans_jamais_bloquer(db):
 
 @pytest.mark.integration
 def test_adverse_media_ne_sapplique_pas_aux_personnes_physiques(db):
-    from sqlalchemy import text
     from app.core.db import set_tenant_context
     from app.services import simple_screening_engine as eng
 
@@ -837,7 +835,6 @@ def test_refresh_conserve_l_identifiant_de_l_entite(db):
 def test_filtrage_exclut_les_entites_radiees(db):
     """Sans cette exclusion, une levée de sanction n'aurait aucun effet :
     l'entité resterait rapprochée indéfiniment."""
-    from sqlalchemy import text
     from app.services import list_refresh
     from app.services.matching import normalize_name, retrieve_candidates, tokenize
 
@@ -1101,7 +1098,6 @@ def test_dedupe_compare_les_graphies_sans_tenir_compte_de_la_casse(db):
     bruts étaient identiques."""
     from sqlalchemy import text
     from app.scripts import dedupe_entities
-    from app.services.matching import tokenize
 
     officielle = _entite(db, "IBRAHIMA SOW", avec_source=True)
     copie = _entite(db, "Ibrahima Sow")
@@ -1129,7 +1125,8 @@ def test_import_csv_accepte_les_libelles_francais(db):
     from sqlalchemy import text
     from app.services import adverse_media_service as ams
 
-    db.execute(text("DELETE FROM adverse_media_records")); db.commit()
+    db.execute(text("DELETE FROM adverse_media_records"))
+    db.commit()
     csv = ("entity_name,category,source,summary\n"
            "Global Mining SARL,Corruption,OCCRP,Licences minières\n"
            "Atlas Trading Ltd,Blanchiment,ICIJ,Réseau présumé\n"
@@ -1151,7 +1148,8 @@ def test_import_csv_est_idempotent(db):
     from sqlalchemy import text
     from app.services import adverse_media_service as ams
 
-    db.execute(text("DELETE FROM adverse_media_records")); db.commit()
+    db.execute(text("DELETE FROM adverse_media_records"))
+    db.commit()
     csv = b"entity_name,category\nSociete Test SA,Fraude\n"
     assert ams.importer_csv(db, csv)["crees"] == 1
     r2 = ams.importer_csv(db, csv)
@@ -1165,7 +1163,8 @@ def test_import_csv_supporte_les_exports_de_tableur(db):
     from sqlalchemy import text
     from app.services import adverse_media_service as ams
 
-    db.execute(text("DELETE FROM adverse_media_records")); db.commit()
+    db.execute(text("DELETE FROM adverse_media_records"))
+    db.commit()
     bom = "﻿entity_name,category\r\nSociété Accentuée SA,Fraude\r\n".encode("utf-8")
     assert ams.importer_csv(db, bom)["crees"] == 1
     latin = "entity_name,category\nSociété Latin SA,Corruption\n".encode("latin-1")
@@ -1186,7 +1185,8 @@ def test_un_signalement_desactive_ne_pese_plus_sur_le_risque(db):
     from sqlalchemy import text
     from app.services import adverse_media_service as ams
 
-    db.execute(text("DELETE FROM adverse_media_records")); db.commit()
+    db.execute(text("DELETE FROM adverse_media_records"))
+    db.commit()
     ams.importer_csv(db, b"entity_name,category\nOmega Trading Ltd,Blanchiment\n")
     assert ams.assess_company(db, "Omega Trading Ltd")["hit"] is True
 
@@ -1231,7 +1231,7 @@ def test_liste_noire_une_levee_produit_son_effet(db):
 
     bl.importer(db, _BL_CSV.encode("utf-8"))
     sans_mamadou = "\n".join(
-        l for l in _BL_CSV.splitlines() if "BCRG-A" not in l) + "\n"
+        ligne for ligne in _BL_CSV.splitlines() if "BCRG-A" not in ligne) + "\n"
     r = bl.importer(db, sans_mamadou.encode("utf-8"))
     assert r["delisted"] == 1
 

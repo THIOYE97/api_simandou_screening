@@ -102,8 +102,10 @@ def list_cases(
         ).mappings().all()
         risk_by_case = {r["case_id"]: r["risk_level"] for r in rows}
     except Exception:
-        try: db.rollback()
-        except Exception: pass
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
     # ── Bulk: client_name depuis screening_requests ──────────────────
     name_by_case: dict[str, str] = {}
@@ -135,17 +137,22 @@ def list_cases(
                 if name:
                     name_by_case[r["case_id"]] = name
     except Exception:
-        try: db.rollback()
-        except Exception: pass
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
     # ── Sérialisation manuelle (bypass Pydantic) ─────────────────────
     def _str(v) -> str | None:
         return str(v) if v is not None else None
 
     def _dt(v) -> str | None:
-        if v is None: return None
-        try: return v.isoformat()
-        except Exception: return str(v)
+        if v is None:
+            return None
+        try:
+            return v.isoformat()
+        except Exception:
+            return str(v)
 
     items = []
     for c in cases:
@@ -285,7 +292,7 @@ def update_case_status(
 
     candidates = STATUS_CANDIDATES.get(new_status)
     if not candidates:
-        raise HTTPException(422, f"Status invalide. Valeurs: PENDING, IN_PROGRESS, CLOSED")
+        raise HTTPException(422, "Status invalide. Valeurs: PENDING, IN_PROGRESS, CLOSED")
 
     # Premier candidat présent dans l'enum réel
     mapped = next((c for c in candidates if c in valid_values), None)

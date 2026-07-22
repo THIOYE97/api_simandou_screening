@@ -6,7 +6,6 @@ import logging
 from typing import List
 from xml.etree import ElementTree as ET
 
-import httpx
 
 from .config import UN_LIST_URL
 from .http_client import fetch_bytes

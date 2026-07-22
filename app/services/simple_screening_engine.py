@@ -9,7 +9,7 @@ import json
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models.screening_db import ScreeningMatch, ScreeningRequest, ScreeningResult
+from app.models.screening_db import ScreeningMatch, ScreeningRequest
 from app.services.matching import (
     band,
     normalize_name,

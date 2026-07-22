@@ -20,7 +20,6 @@ ayant existé, pas une situation actuelle.
 from __future__ import annotations
 
 import enum
-import uuid
 
 from sqlalchemy import Column, DateTime, Enum, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB

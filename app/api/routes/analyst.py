@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 from io import StringIO
 import csv
@@ -11,19 +11,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
-from sqlalchemy.sql import desc
 
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db_rls as get_db
 
-from app.models.case import Case
 from app.models.screening_db import (
     Entity,
     ScreeningMatch,
     ScreeningRequest,
-    ScreeningResult,
     SourceRecord,
 )
 
@@ -1041,7 +1038,8 @@ def export_screenings_csv(
 
         writer.writerow(HEADERS)
         yield buf.getvalue()
-        buf.seek(0); buf.truncate()
+        buf.seek(0)
+        buf.truncate()
 
         for row in result.mappings():
             payload = row.get("request_payload") or {}
@@ -1109,7 +1107,8 @@ def export_screenings_csv(
                 row.get("completed_at") or "",
             ])
             yield buf.getvalue()
-            buf.seek(0); buf.truncate()
+            buf.seek(0)
+            buf.truncate()
 
     risk_part = risk_norm.lower() if risk_norm else "all"
     status_part = status_norm.lower() if status_norm else "all"
