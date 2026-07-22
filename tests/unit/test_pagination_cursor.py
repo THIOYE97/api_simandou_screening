@@ -47,7 +47,8 @@ class TestCursorInvalidInputs:
         assert decode_cursor(garbage) == []
 
     def test_b64_json_but_not_list(self):
-        import base64, json
+        import base64
+        import json
         payload = base64.urlsafe_b64encode(json.dumps({"not": "list"}).encode()).decode().rstrip("=")
         assert decode_cursor(payload) == []
 

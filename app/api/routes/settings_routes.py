@@ -8,7 +8,6 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -401,7 +400,7 @@ def list_users(
         ).mappings().all()
         return JSONResponse(content=[dict(r) for r in rows])
 
-    except Exception as e:
+    except Exception:
         # Retry without role/is_active if columns don't exist
         try:
             db.rollback()

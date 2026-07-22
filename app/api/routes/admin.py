@@ -1,5 +1,4 @@
 from __future__ import annotations
-import math
 from typing import Optional
 from uuid import UUID
 from app.api.deps.auth import get_current_user
@@ -8,11 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import text, select, func
-from uuid import UUID
-from datetime import date, timedelta
+from sqlalchemy import select, func
 
 from app.api.deps.db import get_db_rls as get_db
 from app.models.screening_db import (

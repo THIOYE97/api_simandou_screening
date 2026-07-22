@@ -45,18 +45,46 @@ APP_ROLE = "screening_app"
 BYPASS_ROLE = "auth_bypass_rls"
 
 
+_DOLLAR_TAG = re.compile(r"\$[A-Za-z_0-9]*\$")
+
+
 def _split_sql(sql: str) -> list[str]:
-    """Découpe un script SQL en instructions, en respectant les blocs $$…$$."""
-    stmts, buf, i, in_dollar, tag = [], [], 0, False, ""
-    while i < len(sql):
+    """Découpe un script pg_dump en instructions exécutables.
+
+    Petit lexer : il neutralise les `;` qui n'ont pas valeur de terminateur —
+    ceux nichés dans les commentaires `-- …`, les chaînes `'…'` et les blocs
+    dollar-quote `$tag$…$tag$`. Sans cela, une ligne d'en-tête pg_dump comme
+    `-- Name: x; Type: TABLE; Schema: public; Owner: -` était éclatée en
+    fragments (`Type: TABLE`…) envoyés tels quels à PostgreSQL, faisant échouer
+    tout le chargement du schéma canonique.
+    """
+    stmts, buf, i, n = [], [], 0, len(sql)
+    while i < n:
         ch = sql[i]
-        if not in_dollar and sql.startswith("$$", i):
-            in_dollar, tag = True, "$$"
-            buf.append("$$"); i += 2; continue
-        if in_dollar and sql.startswith(tag, i):
-            in_dollar = False
-            buf.append(tag); i += len(tag); continue
-        if ch == ";" and not in_dollar:
+        # commentaire ligne : on saute jusqu'au saut de ligne inclus
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        # chaîne littérale : un ';' n'y termine rien (les '' échappés se gèrent
+        # par bascule successive)
+        if ch == "'":
+            buf.append(ch); i += 1
+            while i < n:
+                buf.append(sql[i])
+                if sql[i] == "'":
+                    i += 1; break
+                i += 1
+            continue
+        # bloc dollar-quote : $$…$$ ou $tag$…$tag$
+        if ch == "$":
+            m = _DOLLAR_TAG.match(sql, i)
+            if m:
+                tag = m.group(0)
+                end = sql.find(tag, m.end())
+                end = n if end == -1 else end + len(tag)
+                buf.append(sql[i:end]); i = end; continue
+        if ch == ";":
             stmt = "".join(buf).strip()
             if stmt:
                 stmts.append(stmt)
@@ -65,13 +93,21 @@ def _split_sql(sql: str) -> list[str]:
     tail = "".join(buf).strip()
     if tail:
         stmts.append(tail)
-    # retire le bruit pg_dump (SET …, SELECT pg_catalog.set_config…, \connect)
+    # retire le bruit pg_dump résiduel (SET …, SELECT pg_catalog.set_config…,
+    # \connect, COMMENT ON EXTENSION) et les instructions vidées de tout contenu
     out = []
     for s in stmts:
-        first = s.lstrip().split("\n", 1)[0].upper()
-        if first.startswith(("SET ", "SELECT PG_CATALOG", "\\CONNECT", "COMMENT ON EXTENSION")):
+        # une instruction réduite à des lignes de commentaire est sans effet
+        body = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("--")).strip()
+        if not body:
             continue
-        out.append(s)
+        # méta-commandes psql (\restrict, \unrestrict, \connect… — PG 17+)
+        if body.startswith("\\"):
+            continue
+        first = body.split("\n", 1)[0].upper()
+        if first.startswith(("SET ", "SELECT PG_CATALOG", "COMMENT ON EXTENSION")):
+            continue
+        out.append(body)
     return out
 
 
@@ -92,6 +128,12 @@ def main() -> int:
                 f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{role}') "
                 f"THEN CREATE ROLE {role} NOLOGIN; END IF; END $$;"
             ))
+            # L'utilisateur de connexion (propriétaire Render, non-superuser)
+            # doit être MEMBRE du rôle pour pouvoir `SET ROLE` dessus lors du
+            # seed. En dev local la connexion est superuser, ce qui masquait
+            # l'absence de cette appartenance : le seed échouait alors sur
+            # « permission denied to set role » à la première reconstruction.
+            c.execute(text(f"GRANT {role} TO CURRENT_USER"))
         for ext in ("pgcrypto", "pg_trgm", "unaccent", '"uuid-ossp"'):
             c.execute(text(f"CREATE EXTENSION IF NOT EXISTS {ext}"))
     print("✓ rôles + extensions")
@@ -111,6 +153,11 @@ def main() -> int:
         sql = BASELINE.read_text()
         stmts = _split_sql(sql)
         with eng.connect().execution_options(isolation_level="AUTOCOMMIT") as c:
+            # pg_dump crée des fonctions qui référencent des tables définies plus
+            # loin dans le fichier ; il pose pour cela `check_function_bodies` à
+            # false. Le filtre anti-bruit écartant les `SET`, on le repose ici,
+            # sans quoi get_user_for_login (utilisée par /auth/login) échoue.
+            c.execute(text("SET check_function_bodies = false"))
             for s in stmts:
                 try:
                     c.execute(text(s))
@@ -154,6 +201,33 @@ def main() -> int:
         return 1
     print("✓ schéma complet vérifié")
 
+    # 3b) privilèges runtime + contournement RLS du rôle de bypass ----------
+    #
+    # Le dump canonique est produit sans privilèges (pg_dump --no-privileges) :
+    # les rôles applicatifs n'héritent donc d'AUCUN droit sur les tables. On
+    # les accorde ici. Point critique : /auth/login lit `users` sous
+    # `SET ROLE auth_bypass_rls`, AVANT de connaître le tenant — ce rôle doit
+    # donc contourner l'isolation par tenant. L'attribut BYPASSRLS n'est pas
+    # posable sur une base Render (propriétaire non-superuser), mais le
+    # propriétaire des tables PEUT créer une politique permissive équivalente.
+    # Sans ce bloc, toute base reconstruite renvoie « permission denied for
+    # table users » puis, une fois les droits posés, un 401 systématique.
+    with eng.connect().execution_options(isolation_level="AUTOCOMMIT") as c:
+        c.execute(text(f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}, {BYPASS_ROLE}"))
+        for role in (APP_ROLE, BYPASS_ROLE):
+            c.execute(text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}"))
+            c.execute(text(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}"))
+            c.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}"))
+            c.execute(text(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {role}"))
+        rls_tables = [r[0] for r in c.execute(text(
+            "SELECT relname FROM pg_class "
+            "WHERE relrowsecurity AND relnamespace = 'public'::regnamespace ORDER BY relname"))]
+        for t in rls_tables:
+            c.execute(text(f'DROP POLICY IF EXISTS bypass_all ON public."{t}"'))
+            c.execute(text(f'CREATE POLICY bypass_all ON public."{t}" '
+                           f'TO {BYPASS_ROLE} USING (true) WITH CHECK (true)'))
+    print(f"✓ privilèges rôles + contournement RLS ({len(rls_tables)} table(s))")
+
     # 4) seed référentiel + admin ------------------------------------------
     from app.core.config import settings
     from app.core.db import SessionLocal
@@ -162,8 +236,14 @@ def main() -> int:
     )
     from app.services.auth_service import hash_password
 
+    # On sème en tant que propriétaire de connexion — exactement le modèle du
+    # runtime (app/core/db.py se connecte propriétaire, fait RESET ROLE et
+    # isole par GUC app.tenant_id). Le propriétaire contourne la RLS ENABLE
+    # (seule `cases` est en FORCE, non touchée ici). L'ancien
+    # `SET ROLE auth_bypass_rls` ne fonctionnait que sous une connexion
+    # superuser locale : sur une base Render (propriétaire non-superuser) il
+    # échouait — d'abord faute d'appartenance au rôle, puis faute de privilège.
     with eng.begin() as c:
-        c.execute(text(f"SET ROLE {BYPASS_ROLE}"))
         tid = c.execute(text("SELECT id FROM tenants WHERE slug='bcrg' LIMIT 1")).scalar()
         if not tid:
             tid = uuid.uuid4()
@@ -176,7 +256,6 @@ def main() -> int:
                 "INSERT INTO users (id,email,full_name,password_hash,is_active,status,tenant_id) "
                 "VALUES (:i,:e,'Administrateur BCRG',:p,true,'ACTIVE',:t)"),
                 {"i": str(uid), "e": admin_email, "p": hash_password(admin_password), "t": str(tid)})
-        c.execute(text("RESET ROLE"))
 
     db = SessionLocal()
     try:
