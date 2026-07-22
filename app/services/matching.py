@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.cache import cache, make_key
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.models.screening_db import ScreeningMatch, SourceRecord
+from app.models.screening_db import ScreeningMatch
 
 logger = get_logger("simandou.matching")
 

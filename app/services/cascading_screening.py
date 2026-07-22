@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 import json
 
 from sqlalchemy import text
@@ -110,7 +110,7 @@ def start_post_kyc_cascade(case_id: str, db: Session) -> str:
     # 3) Run now (synchronous MVP)
     try:
         _run_screening_request_now(request_id=request_id, db=db)
-    except Exception as e:
+    except Exception:
         # Optionnel: marquer FAILED si tu veux un état DB clair
         # (si ton runner gère déjà FAILED, tu peux enlever ce bloc)
         try:

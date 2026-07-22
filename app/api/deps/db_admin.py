@@ -1,8 +1,7 @@
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header
 from sqlalchemy.orm import Session
 
 from app.api.deps.db import get_db_rls
-from app.core.db import set_tenant_context
 
 def get_db_admin(
     db: Session = Depends(get_db_rls),

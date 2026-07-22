@@ -26,7 +26,7 @@ from typing import Iterator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.services import list_ingest, list_refresh
+from app.services import list_refresh
 
 logger = logging.getLogger("simandou.blacklist")
 

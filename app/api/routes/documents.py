@@ -4,7 +4,6 @@ from __future__ import annotations
 from uuid import UUID
 from pathlib import Path
 from typing import Dict, Any
-from sqlalchemy import text
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -61,10 +60,14 @@ def _guess_mime(doc: Document) -> str:
     if getattr(doc, "mime_type", None):
         return str(doc.mime_type)
     name = (getattr(doc, "original_filename", None) or getattr(doc, "object_key", None) or "").lower()
-    if name.endswith(".pdf"):   return "application/pdf"
-    if name.endswith(".png"):   return "image/png"
-    if name.endswith(".jpg") or name.endswith(".jpeg"): return "image/jpeg"
-    if name.endswith(".webp"):  return "image/webp"
+    if name.endswith(".pdf"):
+        return "application/pdf"
+    if name.endswith(".png"):
+        return "image/png"
+    if name.endswith(".jpg") or name.endswith(".jpeg"):
+        return "image/jpeg"
+    if name.endswith(".webp"):
+        return "image/webp"
     return "application/octet-stream"
 
 
@@ -244,7 +247,7 @@ def _run_ocr_background(doc_id: UUID, tenant_id: str) -> None:
             f"prefill={list(prefill.keys())}"
         )
 
-    except Exception as e:
+    except Exception:
         import traceback
         print(f"[ocr background] ❌ doc={doc_id} tenant={tenant_id}")
         print(traceback.format_exc())

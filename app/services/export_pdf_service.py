@@ -14,7 +14,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
     Image, PageBreak, HRFlowable, KeepTogether,
@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.core.db import set_tenant_context
 
 from app.models.screening_db import (
-    ScreeningMatch, SourceRecord, Entity,
+    SourceRecord, Entity,
 )
 
 # ─── Constants ────────────────────────────────────────────────
@@ -234,9 +234,9 @@ def _load_analyst_decisions(
             rows = db.execute(
                 text(Q.format(col="request_id", p="rid")), {"rid": request_id}
             ).mappings().all()
-            l, h = _rows(rows)
-            if l:
-                return l, h
+            lignes, h = _rows(rows)
+            if lignes:
+                return lignes, h
 
         if case_id:
             rows = db.execute(

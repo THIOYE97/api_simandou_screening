@@ -63,10 +63,14 @@ def _local_path(object_key: str) -> Path:
 
 def _ocr_fields_to_prefill(fields: Dict[str, Any]) -> Dict[str, Any]:
     prefill: Dict[str, Any] = {}
-    if fields.get("last_name"):       prefill["nom"]         = fields["last_name"]
-    if fields.get("first_name"):      prefill["prenom"]      = fields["first_name"]
-    if fields.get("date_of_birth"):   prefill["dob"]         = fields["date_of_birth"]
-    if fields.get("document_number"): prefill["card_number"] = fields["document_number"]
+    if fields.get("last_name"):
+        prefill["nom"] = fields["last_name"]
+    if fields.get("first_name"):
+        prefill["prenom"] = fields["first_name"]
+    if fields.get("date_of_birth"):
+        prefill["dob"] = fields["date_of_birth"]
+    if fields.get("document_number"):
+        prefill["card_number"] = fields["document_number"]
     return prefill
 
 

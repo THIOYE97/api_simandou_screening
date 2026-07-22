@@ -146,10 +146,14 @@ class OCRResult:
 
 def ocr_to_prefill(fields: dict) -> dict:
     prefill: Dict[str, Any] = {}
-    if fields.get("last_name"):       prefill["nom"]         = fields["last_name"]
-    if fields.get("first_name"):      prefill["prenom"]      = fields["first_name"]
-    if fields.get("date_of_birth"):   prefill["dob"]         = fields["date_of_birth"]
-    if fields.get("document_number"): prefill["card_number"] = fields["document_number"]
+    if fields.get("last_name"):
+        prefill["nom"] = fields["last_name"]
+    if fields.get("first_name"):
+        prefill["prenom"] = fields["first_name"]
+    if fields.get("date_of_birth"):
+        prefill["dob"] = fields["date_of_birth"]
+    if fields.get("document_number"):
+        prefill["card_number"] = fields["document_number"]
     return prefill
 
 
