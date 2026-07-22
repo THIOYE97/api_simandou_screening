@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -90,7 +89,6 @@ def main() -> int:
         logger.warning("RENDER_API_KEY / RENDER_PROD_DB_ID absents — sauvegarde ignorée.")
         return 0  # abstention propre, pas un échec
 
-    started = datetime.now(timezone.utc)
     try:
         avant = {e.get("id") for e in _list_exports()}
         _trigger_export()
