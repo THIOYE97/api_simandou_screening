@@ -134,3 +134,44 @@ services:
         sync: false
       - key: BREVO_TO_EMAIL
         sync: false
+
+  # Sauvegarde quotidienne : export logique daté de la production, en
+  # complément des sauvegardes physiques natives du plan pro. Copie portable,
+  # téléchargeable, archivable pour la Conformité. 04:00 UTC, avant le
+  # rafraîchissement des listes. S'abstient proprement si la clé API est
+  # absente (rien ne casse), et trace chaque exécution par courriel.
+  - type: cron
+    name: sauvegarde-prod-lbcft
+    runtime: python
+    plan: starter
+    region: frankfurt
+    branch: main
+    schedule: "0 4 * * *"
+    buildCommand: ./build.sh
+    startCommand: python -m app.scripts.backup_prod
+    envVars:
+      - key: ENVIRONMENT
+        value: staging
+      # Nécessaires uniquement pour satisfaire l'import de la configuration.
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      # ⚠ Clé API à portée COMPTE : donne à ce cron un accès Render complet.
+      # À renseigner en connaissance de cause ; sans elle, la sauvegarde est
+      # simplement ignorée (le cron ne casse pas).
+      - key: RENDER_API_KEY
+        sync: false
+      - key: RENDER_PROD_DB_ID
+        value: dpg-d6jcgftm5p6s73dlnlng-a
+      # Trace par courriel — mêmes réglages Brevo que le refresh des listes.
+      - key: BREVO_SMTP_LOGIN
+        sync: false
+      - key: BREVO_SMTP_KEY
+        sync: false
+      - key: BREVO_FROM_EMAIL
+        sync: false
+      - key: BREVO_FROM_NAME
+        sync: false
+      - key: BREVO_TO_EMAIL
+        sync: false
