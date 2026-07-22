@@ -1,0 +1,42 @@
+PostgreSQL : postgres (PostgreSQL) 18.1 (Ubuntu 18.1-1.pgdg24.04+2)
+=== 1) Initialisation du PRIMAIRE (Prod) ===
+  primaire démarré sur 6432
+  table 'operations' créée, 1 ligne insérée
+=== 2) Création du STANDBY (Backup) par pg_basebackup (copie + streaming) ===
+  standby démarré sur 6433 (lecture seule, réplication en flux)
+=== 3) PREUVE : le primaire voit le standby connecté en streaming ===
+-[ RECORD 1 ]----+----------------
+application_name | walreceiver
+state            | streaming
+sync_state       | async
+write_lag        | 00:00:00.000123
+flush_lag        | 00:00:00.000123
+replay_lag       | 00:00:00.000123
+
+=== 4) PREUVE temps réel : écriture sur le PRIMAIRE, mesure de la latence ===
+  3 lignes insérées sur le primaire (total attendu sur le standby : 4)
+  ✅ les 4 lignes sont sur le STANDBY après 298 ms (temps réel)
+ id |              libelle               |            cree_a             
+----+------------------------------------+-------------------------------
+  1 | opération initiale sur le primaire | 2026-07-22 12:21:39.444884+00
+  2 | virement interbancaire RTGS        | 2026-07-22 12:21:45.787834+00
+  3 | chèque télé-compense ACP           | 2026-07-22 12:21:45.787834+00
+  4 | MT103 SWIFT entrant                | 2026-07-22 12:21:45.787834+00
+(4 rows)
+
+=== 5) Lag de réplication (≈ 0) + standby en lecture seule ===
+ lag octets = 0
+
+ERROR:  cannot execute INSERT in a read-only transaction
+=== 6) BASCULE (failover) : promotion du STANDBY en primaire ===
+ encore_standby 
+----------------
+ f
+(1 row)
+
+ lignes_apres_bascule 
+----------------------
+                    5
+(1 row)
+
+OK — démonstration terminée.
