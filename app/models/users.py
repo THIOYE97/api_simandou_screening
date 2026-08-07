@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from sqlalchemy import Column, Text, Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, Text, Boolean, DateTime, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -31,6 +31,12 @@ class User(Base):
     # ✅ multi-tenant
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=True, index=True)
     tenant = relationship("Tenant", lazy="joined")
+
+    # ✅ dernière connexion réussie — dénormalisé depuis `login_events` pour
+    # répondre en une requête à « ce compte sert-il encore ? » sans balayer
+    # le journal. Le détail (échecs, IP successives) reste dans login_events.
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    last_login_ip = Column(String(64), nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

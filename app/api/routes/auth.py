@@ -1,7 +1,7 @@
 # app/api/routes/auth.py
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from app.schemas.auth import (
     RefreshRequest,
     TokenPairResponse,
 )
+from app.services import login_audit_service
 from app.services.auth_service import (
     consume_refresh_token,
     create_access_token,
@@ -61,6 +62,7 @@ def _access_token_for(user: dict) -> tuple[str, int]:
 def login(
     request: Request,
     payload: Annotated[LoginRequest, Body()],
+    background: BackgroundTasks,
     db: Session = Depends(get_db_public),
 ):
     _reset_session(db)
@@ -71,17 +73,37 @@ def login(
         logger.exception("SET ROLE auth_bypass failed")
         raise HTTPException(status_code=500, detail="Auth DB role misconfigured")
 
+    ip, ua = _client_meta(request)
+
     try:
         u = get_user_by_email(db, payload.email)
 
         if not u:
             logger.info("login_failed", extra={"email": payload.email, "reason": "unknown_user"})
+            login_audit_service.record_safe(
+                db,
+                event=login_audit_service.EVENT_LOGIN_FAILED,
+                email=payload.email,
+                ip=ip,
+                user_agent=ua,
+                reason="unknown_user",
+            )
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         if not verify_password(payload.password, u.get("password_hash") or ""):
             logger.info(
                 "login_failed",
                 extra={"email": payload.email, "user_id": u.get("id"), "reason": "bad_password"},
+            )
+            login_audit_service.record_safe(
+                db,
+                event=login_audit_service.EVENT_LOGIN_FAILED,
+                email=payload.email,
+                user_id=str(u["id"]),
+                tenant_id=str(u["tenant_id"]) if u.get("tenant_id") else None,
+                ip=ip,
+                user_agent=ua,
+                reason="bad_password",
             )
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -90,12 +112,21 @@ def login(
                 "login_failed",
                 extra={"email": payload.email, "user_id": u.get("id"), "reason": "disabled"},
             )
+            login_audit_service.record_safe(
+                db,
+                event=login_audit_service.EVENT_LOGIN_FAILED,
+                email=payload.email,
+                user_id=str(u["id"]),
+                tenant_id=str(u["tenant_id"]) if u.get("tenant_id") else None,
+                ip=ip,
+                user_agent=ua,
+                reason="disabled",
+            )
             raise HTTPException(status_code=403, detail="User disabled")
 
         # Émet l'access token + persiste un refresh token
         access_token, expires_in = _access_token_for(u)
 
-        ip, ua = _client_meta(request)
         refresh_token, refresh_expires_at = issue_refresh_token(
             db,
             user_id=str(u["id"]),
@@ -104,6 +135,29 @@ def login(
             user_agent=ua,
         )
         db.commit()
+
+        # Journal de connexion — APRÈS le commit de la session : une panne du
+        # journal ne doit pas annuler une connexion déjà acquise.
+        evenement = login_audit_service.record_safe(
+            db,
+            event=login_audit_service.EVENT_LOGIN_OK,
+            email=u.get("email") or payload.email,
+            user_id=str(u["id"]),
+            tenant_id=str(u["tenant_id"]),
+            ip=ip,
+            user_agent=ua,
+            detect_new_context=True,
+        )
+        login_audit_service.touch_last_login(db, user_id=str(u["id"]), ip=ip)
+
+        # Adresse ou appareil jamais vus → alerte à la Conformité, hors du
+        # chemin de réponse (une session SMTP prend plusieurs secondes).
+        if evenement and evenement.get("is_new_context"):
+            background.add_task(
+                login_audit_service.notify_new_context,
+                evenement,
+                full_name=u.get("full_name"),
+            )
 
         user_id_ctx.set(str(u["id"]))
         logger.info(
@@ -154,10 +208,14 @@ def refresh(
         # Recharge l'utilisateur (status peut avoir changé entre login et refresh)
         u = db.execute(
             text("""
-                SELECT id::text AS id, email, full_name, is_active, status,
-                       tenant_id::text AS tenant_id
-                FROM public.users
-                WHERE id = CAST(:uid AS uuid)
+                SELECT u.id::text AS id, u.email, u.full_name, u.is_active, u.status,
+                       u.tenant_id::text AS tenant_id,
+                       EXISTS (
+                         SELECT 1 FROM public.user_roles ur
+                         WHERE ur.user_id = u.id AND ur.role = 'SUPER_ADMIN'
+                       ) AS is_super_admin
+                FROM public.users u
+                WHERE u.id = CAST(:uid AS uuid)
             """),
             {"uid": found["user_id"]},
         ).mappings().first()
@@ -181,6 +239,16 @@ def refresh(
                 user_agent=ua,
             )
             db.commit()
+            login_audit_service.record_safe(
+                db,
+                event=login_audit_service.EVENT_REFRESH,
+                email=u["email"],
+                user_id=str(u["id"]),
+                tenant_id=str(u["tenant_id"]),
+                ip=ip,
+                user_agent=ua,
+                reason="rotated",
+            )
             logger.info("refresh_rotated", extra={"user_id": str(u["id"])})
             return TokenPairResponse(
                 access_token=access_token,
@@ -210,6 +278,7 @@ def refresh(
 
 @router.post("/logout", status_code=204)
 def logout(
+    request: Request,
     payload: LogoutRequest,
     user=Depends(get_current_user),
     db: Session = Depends(get_db_public),
@@ -230,14 +299,30 @@ def logout(
         logger.exception("SET ROLE auth_bypass failed (logout)")
         raise HTTPException(status_code=500, detail="Auth DB role misconfigured")
 
+    ip, ua = _client_meta(request)
+
+    def _trace(motif: str) -> None:
+        login_audit_service.record_safe(
+            db,
+            event=login_audit_service.EVENT_LOGOUT,
+            email=user.get("email"),
+            user_id=str(user["id"]),
+            tenant_id=str(user["tenant_id"]) if user.get("tenant_id") else None,
+            ip=ip,
+            user_agent=ua,
+            reason=motif,
+        )
+
     try:
         if payload.all_devices:
             n = revoke_all_user_tokens(db, user_id=str(user["id"]), reason="logout_all")
             db.commit()
+            _trace("logout_all")
             logger.info("logout_all", extra={"user_id": str(user["id"]), "revoked": n})
         elif payload.refresh_token:
             revoke_refresh_token(db, token=payload.refresh_token, reason="logout")
             db.commit()
+            _trace("logout")
             logger.info("logout_single", extra={"user_id": str(user["id"])})
         else:
             # Pas de refresh fourni, pas de all_devices → noop accepté

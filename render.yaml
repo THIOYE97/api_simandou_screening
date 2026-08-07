@@ -83,6 +83,24 @@ services:
       - key: ANTHROPIC_API_KEY
         sync: false
 
+      # --- Alerte de connexion inhabituelle (journal des connexions) ---------
+      # L'alerte part du service WEB (c'est lui qui authentifie), d'où la
+      # reprise des identifiants SMTP déjà utilisés par les crons. Sans eux,
+      # le journal continue de tout enregistrer : seul le courriel est ignoré.
+      - key: BREVO_SMTP_LOGIN
+        sync: false
+      - key: BREVO_SMTP_KEY
+        sync: false
+      - key: BREVO_FROM_EMAIL
+        sync: false
+      - key: BREVO_FROM_NAME
+        value: Simandou Conformité
+      # Destinataire des alertes de connexion. À défaut, BREVO_TO_EMAIL.
+      - key: LOGIN_ALERT_TO_EMAIL
+        sync: false
+      - key: LOGIN_ALERT_ENABLED
+        value: "true"
+
       # --- Seed des 2 comptes (facultatif : surcharge les mots de passe) -----
       # - key: SEED_COMPLIANCE_PASSWORD
       #   sync: false

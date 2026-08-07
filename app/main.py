@@ -40,6 +40,7 @@ from app.api.routes.referentiel import router as referentiel_router  # noqa: E40
 from app.api.routes.reporting import router as reporting_router  # noqa: E402
 from app.api.routes.scoring import router as scoring_router  # noqa: E402
 from app.api.routes.screening import router as screening_router  # noqa: E402
+from app.api.routes.security import router as security_router  # noqa: E402
 from app.api.routes.settings_routes import router as settings_router  # noqa: E402
 
 
@@ -121,3 +122,4 @@ app.include_router(integration_router)
 app.include_router(rbac_router)
 app.include_router(adverse_media_router)
 app.include_router(blacklist_router)
+app.include_router(security_router)

@@ -126,19 +126,33 @@ def _render_html(report: dict) -> str:
 
 # ── Brevo SMTP ────────────────────────────────────────────────────────────────
 
-def _send_brevo_smtp(subject: str, html: str):
-    if not (BREVO_SMTP_LOGIN and BREVO_SMTP_KEY and BREVO_FROM_EMAIL and BREVO_TO_EMAIL):
+def send_html_email(subject: str, html: str, recipients: Optional[str] = None) -> None:
+    """
+    Envoi générique par le relais déjà configuré.
+
+    Exposé pour les autres modules qui doivent notifier la Conformité (journal
+    de connexions, par exemple) sans redéclarer une configuration SMTP.
+    """
+    _send_brevo_smtp(subject, html, recipients=recipients)
+
+
+def _send_brevo_smtp(subject: str, html: str, recipients: Optional[str] = None):
+    # `recipients` (liste séparée par des virgules) permet à un module de viser
+    # une autre boîte que celle du compte rendu des listes.
+    brut = recipients or BREVO_TO_EMAIL
+
+    if not (BREVO_SMTP_LOGIN and BREVO_SMTP_KEY and BREVO_FROM_EMAIL and brut):
         logger.info("Brevo SMTP not fully configured – skipping email")
         return
 
-    recipients = [r.strip() for r in BREVO_TO_EMAIL.split(",") if r.strip()]
-    if not recipients:
+    destinataires = [r.strip() for r in brut.split(",") if r.strip()]
+    if not destinataires:
         return
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = f"{BREVO_FROM_NAME} <{BREVO_FROM_EMAIL}>"
-    msg["To"]      = ", ".join(recipients)
+    msg["To"]      = ", ".join(destinataires)
     msg.attach(MIMEText(html, "html", "utf-8"))
 
     try:
@@ -146,8 +160,8 @@ def _send_brevo_smtp(subject: str, html: str):
             srv.ehlo()
             srv.starttls()
             srv.login(BREVO_SMTP_LOGIN, BREVO_SMTP_KEY)
-            srv.sendmail(BREVO_FROM_EMAIL, recipients, msg.as_string())
-        logger.info("Brevo SMTP email sent to %s", recipients)
+            srv.sendmail(BREVO_FROM_EMAIL, destinataires, msg.as_string())
+        logger.info("Brevo SMTP email sent to %s", destinataires)
     except Exception as exc:
         logger.error("Brevo SMTP email failed: %s", exc)
 
