@@ -98,18 +98,28 @@ def decode_access_token(token: str) -> Dict[str, Any]:
 def get_user_by_email(db: Session, email: str):
     email_norm = (email or "").strip().lower()
 
+    # `is_super_admin` est calculé ici, à la source du jeton. Sans cela, la
+    # revendication émise dans l'access token valait toujours `false` et TOUTES
+    # les portes qui en dépendent (bascule de tenant, console de sécurité,
+    # contexte RLS super-admin) restaient fermées pour tout le monde. Le rôle
+    # SUPER_ADMIN n'étant attribué à personne par défaut, ce calcul ne change
+    # rien aux comptes existants.
     row = db.execute(
         text("""
             SELECT
-              id::text AS id,
-              email,
-              full_name,
-              password_hash,
-              is_active,
-              status,
-              tenant_id::text AS tenant_id
-            FROM public.users
-            WHERE lower(trim(email)) = :email
+              u.id::text AS id,
+              u.email,
+              u.full_name,
+              u.password_hash,
+              u.is_active,
+              u.status,
+              u.tenant_id::text AS tenant_id,
+              EXISTS (
+                SELECT 1 FROM public.user_roles ur
+                WHERE ur.user_id = u.id AND ur.role = 'SUPER_ADMIN'
+              ) AS is_super_admin
+            FROM public.users u
+            WHERE lower(trim(u.email)) = :email
             LIMIT 1
         """),
         {"email": email_norm},
