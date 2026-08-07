@@ -20,6 +20,7 @@ l'access token, pas relue à chaque requête.
 from __future__ import annotations
 
 import sys
+from typing import Optional
 
 from sqlalchemy import text
 
@@ -34,16 +35,71 @@ def _bypass(conn) -> None:
     conn.execute(text(f"SET ROLE {settings.AUTH_BYPASS_ROLE}"))
 
 
+def _colonnes(conn) -> set[str]:
+    """
+    Colonnes réelles de `user_roles`, relevées en base et non déduites du modèle.
+
+    Le modèle `app/models/user_role.py` déclare `id`, `tenant_id` et
+    `created_at` ; la base de production n'a que `(user_id, role)`. Comme le
+    schéma de test est construit depuis les modèles, l'écart est invisible en
+    test et n'apparaît qu'à l'exécution. On écrit donc contre ce que la base
+    contient, ce qui rend ce script valable sur les deux schémas.
+    """
+    return {
+        r[0]
+        for r in conn.execute(
+            text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'user_roles'
+            """)
+        )
+    }
+
+
+def construire_insert(
+    colonnes: set[str], *, user_id: str, tenant_id: Optional[str] = None
+) -> tuple[str, dict]:
+    """
+    Construit l'INSERT adapté aux colonnes réellement présentes.
+
+    Production : `(user_id, role)` seulement. Base créée depuis les modèles :
+    `id` et `tenant_id` en plus, tous deux NOT NULL. Une seule requête écrite
+    en dur ne peut pas satisfaire les deux — d'où cette construction.
+    """
+    if not {"user_id", "role"} <= colonnes:
+        raise RuntimeError("Table `user_roles` inattendue : colonnes user_id/role absentes.")
+
+    champs = ["user_id", "role"]
+    valeurs = ["CAST(:uid AS uuid)", f"'{ROLE}'"]
+    params: dict = {"uid": str(user_id)}
+
+    if "id" in colonnes:
+        champs.insert(0, "id")
+        valeurs.insert(0, "gen_random_uuid()")
+    if "tenant_id" in colonnes:
+        champs.append("tenant_id")
+        valeurs.append("CAST(:tid AS uuid)")
+        params["tid"] = str(tenant_id) if tenant_id else None
+
+    return (
+        f"INSERT INTO public.user_roles ({', '.join(champs)}) "
+        f"VALUES ({', '.join(valeurs)})",
+        params,
+    )
+
+
 def lister() -> int:
     with engine.begin() as conn:
         _bypass(conn)
+        date_dispo = "created_at" in _colonnes(conn)
+        depuis = "ur.created_at" if date_dispo else "NULL::timestamptz"
         rows = conn.execute(
             text(f"""
-                SELECT u.email, u.full_name, ur.created_at
+                SELECT u.email, u.full_name, {depuis} AS depuis
                 FROM public.user_roles ur
                 JOIN public.users u ON u.id = ur.user_id
-                WHERE ur.role = '{ROLE}'
-                ORDER BY ur.created_at
+                WHERE ur.role::text = '{ROLE}'
+                ORDER BY u.email
             """)
         ).mappings().all()
 
@@ -52,7 +108,8 @@ def lister() -> int:
         return 0
     print(f"{len(rows)} super-administrateur(s) :")
     for r in rows:
-        print(f"  · {r['email']}  ({r['full_name']})  depuis le {r['created_at']:%d/%m/%Y}")
+        quand = f"  depuis le {r['depuis']:%d/%m/%Y}" if r["depuis"] else ""
+        print(f"  · {r['email']}  ({r['full_name']}){quand}")
     return 0
 
 
@@ -72,29 +129,38 @@ def appliquer(email: str, *, revoke: bool) -> int:
         if not row:
             print(f"✗ Aucun compte pour {email}")
             return 1
-        if not row["tenant_id"]:
-            print(f"✗ {email} n'est rattaché à aucun tenant — rattachez-le d'abord.")
-            return 1
 
         if revoke:
             n = conn.execute(
                 text(f"""
                     DELETE FROM public.user_roles
-                    WHERE user_id = CAST(:uid AS uuid) AND role = '{ROLE}'
+                    WHERE user_id = CAST(:uid AS uuid) AND role::text = '{ROLE}'
                 """),
                 {"uid": row["id"]},
             ).rowcount
             print(f"✓ SUPER_ADMIN retiré à {email}" if n else f"= {email} n'était pas SUPER_ADMIN")
-        else:
-            conn.execute(
-                text(f"""
-                    INSERT INTO public.user_roles (id, tenant_id, user_id, role)
-                    VALUES (gen_random_uuid(), CAST(:tid AS uuid), CAST(:uid AS uuid), '{ROLE}')
-                    ON CONFLICT (tenant_id, user_id, role) DO NOTHING
-                """),
-                {"tid": row["tenant_id"], "uid": row["id"]},
-            )
-            print(f"✓ {email} ({row['full_name']}) est super-administrateur.")
+            print("→ Effectif à la prochaine connexion (la revendication est dans le jeton).")
+            return 0
+
+        deja = conn.execute(
+            text(f"""
+                SELECT 1 FROM public.user_roles
+                WHERE user_id = CAST(:uid AS uuid) AND role::text = '{ROLE}'
+            """),
+            {"uid": row["id"]},
+        ).first()
+        if deja:
+            print(f"= {email} est déjà super-administrateur.")
+            return 0
+
+        cols = _colonnes(conn)
+        if "tenant_id" in cols and not row["tenant_id"]:
+            print(f"✗ {email} n'est rattaché à aucun tenant — rattachez-le d'abord.")
+            return 1
+
+        sql, params = construire_insert(cols, user_id=row["id"], tenant_id=row["tenant_id"])
+        conn.execute(text(sql), params)
+        print(f"✓ {email} ({row['full_name']}) est super-administrateur.")
 
     print("→ Effectif à la prochaine connexion (la revendication est dans le jeton).")
     return 0

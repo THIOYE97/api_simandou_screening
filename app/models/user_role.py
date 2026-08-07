@@ -12,6 +12,25 @@ from app.models.base import Base
 
 
 class UserRole(Base):
+    """
+    ⚠ Ce modèle NE DÉCRIT PAS la table de production.
+
+    En production, `user_roles` vaut exactement :
+
+        CREATE TABLE public.user_roles (
+            user_id uuid NOT NULL,
+            role    public.user_role NOT NULL,   -- ENUM, pas varchar
+            PRIMARY KEY (user_id, role)
+        );
+
+    Ni `id`, ni `tenant_id`, ni `created_at`. L'écart est invisible en test,
+    puisque le schéma de test est construit depuis ce modèle : tout code écrit
+    d'après ces colonnes passe les tests et échoue en production. Écrire contre
+    `information_schema` quand on touche cette table (cf.
+    `app/scripts/grant_super_admin.py`), ou aligner le modèle sur la base par
+    une migration dédiée.
+    """
+
     __tablename__ = "user_roles"
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
